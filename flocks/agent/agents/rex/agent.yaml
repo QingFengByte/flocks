@@ -1,0 +1,11 @@
+name: rex
+description: >-
+  Powerful AI orchestrator for security operations. Analyzes threats,
+  plans strategically, and delegates to specialized agents.
+mode: primary
+hidden: false
+color: "#00CED1"
+delegatable: false
+# tools: null means allow all tools (rex is primary orchestrator with full access)
+# minus call_omo_agent which is denied
+# prompt is left empty – injected dynamically by prompt_builder.py

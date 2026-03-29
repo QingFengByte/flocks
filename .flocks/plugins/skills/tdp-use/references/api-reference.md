@@ -1,0 +1,554 @@
+# TDP API 调用指南
+
+本 skill 默认直接调用 `tdp_api` provider 下的 tool。
+
+## 先看这张路由表
+
+| 用户意图 | 推荐 tool | 常用 action | 最小参数 |
+|---|---|---|---|
+| 看安全态势、趋势、TOP 统计 | `tdp_dashboard_status` | `status` / `security` / `threat_event` / `alert_level_trend` | 通常可空参 |
+| 查原始告警日志 | `tdp_log_search` | `search` | `time_from`、`time_to`、`sql` |
+| 查字段聚合统计 | `tdp_log_search` | `terms` | `time_from`、`time_to`、`term` |
+| 查威胁事件列表 | `tdp_incident_list` | `search` | `time_from`、`time_to` |
+| 看事件时间线 / 结果分布 / 攻击者明细 | `tdp_incident_list` | `timeline` / `result_distribution` / `attacker_ip_detail` | 通常先要 `incident_id` |
+| 查外部攻击严重性分布 | `tdp_threat_inbound_attack` | 默认 | `time_from`、`time_to` |
+| 查告警主机汇总 / 主机下事件 | `tdp_host_threat_list` | `summary` / `events` | `events` 至少要 `asset_machine` |
+| 查脆弱性 | `tdp_vulnerability_list` | 默认 | 常见补 `time_from`、`time_to`、`condition`、`page` |
+| 查弱口令 | `tdp_login_weakpwd_list` | 默认 | 常见补 `time_from`、`time_to` |
+| 查服务 / 主机 / 框架资产 | `tdp_machine_asset_list` | `service_list` / `host_asset_list` / `web_app_framework_list` | 可空参或补 `condition` |
+| 查域名资产 | `tdp_assets_domain_list` | 默认 | 可空参或补 `condition` |
+| 查登录入口 | `tdp_login_api_list` | `list` / `summary` / `category` | 常见补时间范围 |
+| 查上传接口 | `tdp_asset_upload_api` | `summary` / `host_list` / `interface_list` | 常见补时间范围 |
+| 查 API 接口 / API 风险 | `tdp_interface_list` / `tdp_interface_risk_list` | 默认 | 常见补 `condition`、`page` |
+| 查隐私拓扑 / 云服务访问 | `tdp_privacy_diagram` / `tdp_cloud_facilities` | `access_source` / `instance_list` 等 | 常见补时间范围 |
+| 查 MDR 研判列表 / 指标 | `tdp_mdr_alert_list` | `list` / `indicator` | 常见补时间范围 |
+| 查系统状态 | `tdp_system_status` | `all` / `core` / `database` 等 | 通常空参 |
+| 下载 PCAP / 恶意文件 | `tdp_pcap_download` / `tdp_file_download` | 默认 | `alert_id + occ_time` 或 `hash` |
+| 管理平台配置 / 策略 | `tdp_platform_config` / `tdp_policy_settings` | 多 action | 写操作，必须先获用户确认 |
+
+## 时间参数注意事项（重点）
+
+调用任何时间相关 API 时，必须**动态计算**时间戳，禁止手动估算。
+
+** 错误方法（禁止） **
+```python
+# 手动估算，硬编码
+time_from = 1740332800  # 瞎猜的值
+```
+
+** 正确方法 **
+```
+import datetime
+
+# 动态获取今日时间范围
+now = datetime.datetime.now()
+today_start = int(datetime.datetime.combine(now.date(), datetime.time.min).timestamp())
+today_end = int(datetime.datetime.combine(now.date(), datetime.time.max).timestamp())
+
+# 使用计算出的时间戳
+tdp_log_search(time_from=today_start, time_to=today_end, sql="...")
+``` 
+
+## 通用调用方式
+
+TDP 的 tool 主要有 4 类：
+
+1. `action + 根级参数`
+   常见于 `tdp_dashboard_status`、`tdp_log_search`、`tdp_incident_list`、`tdp_mdr_alert_list`
+2. 仅根级参数
+   常见于 `tdp_vulnerability_list`、`tdp_assets_domain_list`、`tdp_interface_list`
+3. `condition` / `page` 组合
+   用于筛选和分页，tool 会把根级 `time_from`、`time_to` 自动写入 `condition`
+4. 下载或配置专用参数
+   例如 `tdp_pcap_download.alert_id`、`tdp_file_download.hash`、`tdp_platform_config.asset`
+
+最常见的调用形态是：
+
+```json
+{
+  "action": "search",
+  "time_from": 1741536000,
+  "time_to": 1741622400
+}
+```
+
+或者：
+
+```json
+{
+  "condition": {
+    "severity": ["3", "4"]
+  },
+  "page": {
+    "cur_page": 1,
+    "page_size": 20
+  }
+}
+```
+
+
+示例：
+
+```json
+{
+  "time_from": 1741536000,
+  "time_to": 1741622400
+}
+```
+
+## 先区分事件、告警和主机
+
+在 TDP 中，这几类数据不是一回事：
+
+| 用户实际要查什么 | 推荐 tool | 说明 |
+|---|---|---|
+| 威胁事件 / 攻击事件 / 事件总览 | `tdp_incident_list` / `tdp_threat_inbound_attack` | 事件维度，平台已聚合 |
+| 告警 / 告警日志 / 原始检测记录 | `tdp_log_search` | 告警维度，一条就是一条原始记录 |
+| 告警主机 / 受害主机 / 主机下事件 | `tdp_host_threat_list` | 主机维度，按主机聚合 |
+| 漏洞、弱口令、登录入口、API 风险等 | 对应资产或风险类 tool | 资产/风险维度，不要混进日志查询 |
+
+建议按下面的用词来路由：
+
+- 提到“告警”“最近一小时告警”“查某 IP 的告警”时，默认优先 `tdp_log_search`
+- 提到“威胁事件”“攻击事件”“看下最近有什么事件”时，优先 `tdp_incident_list`
+- 提到“哪些主机被打了”“告警主机”“受害主机”时，优先 `tdp_host_threat_list`
+- 用户没说清时，默认把“明细”理解为告警日志，把“总览/聚合”理解为事件
+
+## 高频场景
+
+### 1. 安全看板 / 态势统计
+
+推荐：
+
+- `tdp_dashboard_status`
+
+高频 action：
+
+- `status`: 整体概览
+- `security`: 安全统计
+- `threat_event`: 威胁事件统计
+- `threat_topic`: 威胁主题
+- `alert_level_trend`: 告警级别趋势
+- `attack_assets_all` / `attack_assets_public` / `attack_assets_new`: 攻击资产视角
+- `vulnerability`: 脆弱性看板
+- `login_api`: 登录入口看板
+- `privacy_info`: 敏感信息看板
+
+最小示例：
+
+```json
+{
+  "action": "status"
+}
+```
+
+带时间范围的示例：
+
+```json
+{
+  "action": "alert_level_trend",
+  "time_from": 1741536000,
+  "time_to": 1741622400
+}
+```
+
+返回结果重点关注：
+
+- 总数、趋势、TOP 排名、按级别/类型聚合结果
+- 是否存在 `list`、`rows`、`series`、`data` 等列表字段
+
+### 2. 原始告警日志检索
+
+推荐：
+
+- `tdp_log_search`
+- `action=search`
+
+如果只是常规查告警，直接按本节示例构造查询即可；只有在 SQL 操作符、字段名、枚举值不确定时，再查看 [instruction.md](instruction.md)。
+
+最小可运行参数集：
+
+- `action=search` 时 `sql` 为必填
+
+```json
+{
+  "action": "search",
+  "time_from": 1741536000,
+  "time_to": 1741622400,
+  "sql": "threat.level = 'attack'",
+  "net_data_type": ["attack", "risk", "action"]
+}
+```
+
+按页面常见字段返回的示例：
+
+```json
+{
+  "action": "search",
+  "time_from": 1741536000,
+  "time_to": 1741622400,
+  "sql": "threat.level = 'attack' AND threat.result = 'success'",
+  "net_data_type": ["attack"],
+  "columns": [
+    {"label": "类型", "value": ["threat.level", "threat.result"]},
+    {"label": "日期", "value": "time"},
+    {"label": "威胁名称", "value": "threat.name"},
+    {"label": "源IP", "value": "net.src_ip"},
+    {"label": "目的IP", "value": "net.dest_ip"}
+  ]
+}
+```
+
+查询单条告警详情时，优先用全字段模式：
+
+```json
+{
+  "action": "search",
+  "time_from": 1741536000,
+  "time_to": 1741622400,
+  "sql": "threat.id = '1769'",
+  "net_data_type": ["attack", "risk", "action"]
+}
+```
+
+返回结果重点关注：
+
+- `threat.result`
+- `threat.name`
+- `net.src_ip` / `net.dest_ip`
+- `net.http.url`
+- `threat.msg`
+- `threat.id`
+- 原始报文、payload、HTTP 请求/响应相关字段
+
+常见失败原因：
+
+- `sql` 字段和值不匹配
+- 数值字段误加引号
+- `time_from` / `time_to` 单位错成毫秒
+- 需要全字段详情却仍在使用精简列模式
+
+字段、操作符或枚举值仍不确定时，再下钻查看 [instruction.md](instruction.md)。
+
+何时回退浏览器：
+
+- 需要在页面里继续点击事件、查看原始报文、下载 PCAP
+- 需要图形化详情或交互式下钻
+
+### 3. 字段聚合统计
+
+推荐：
+
+- `tdp_log_search`
+- `action=terms`
+
+最小示例：
+
+```json
+{
+  "action": "terms",
+  "time_from": 1741536000,
+  "time_to": 1741622400,
+  "sql": "threat.level = 'attack'",
+  "term": "threat.name"
+}
+```
+
+适合：
+
+- 统计某时间段内最多的威胁名称
+- 聚合源 IP、目的 IP、URL、威胁类型
+
+### 4. 威胁事件列表
+
+推荐：
+
+- `tdp_incident_list`
+- `action=search`
+
+最小可运行参数集：
+
+```json
+{
+  "action": "search",
+  "time_from": 1741536000,
+  "time_to": 1741622400,
+  "condition": {
+    "sql": "(threat.level IN ('attack')) AND threat.type NOT IN ('recon')",
+    "refresh_rate": -1
+  },
+  "page": {
+    "cur_page": 1,
+    "page_size": 20,
+    "sort": [{"sort_by": "time", "sort_order": "desc"}]
+  }
+}
+```
+
+高频 action：
+
+- `search`: 事件列表
+- `top_attacked_entity`: 受攻击实体
+- `result`: 事件研判结果
+- `timeline`: 时间线
+- `alert_search`: 事件下告警列表
+- `result_distribution`: 结果分布
+- `attacker_ip_list`: 攻击者 IP 列表
+- `attacker_ip_detail`: 攻击者 IP 详情
+
+返回结果重点关注：
+
+- 事件 ID
+- 攻击者 / 受害者
+- `threat.result`
+- `threat.severity`
+- 检出次数、最近发现时间
+
+何时回退浏览器：
+
+- 需要进入事件详情页
+- 需要威胁图、原始报文、PCAP 或页面级联动
+
+### 5. 主机、外部攻击与风险类查询
+
+外部攻击分布：
+
+```json
+{
+  "time_from": 1741536000,
+  "time_to": 1741622400
+}
+```
+
+告警主机汇总：
+
+```json
+{
+  "action": "summary",
+  "time_from": 1741536000,
+  "time_to": 1741622400,
+  "condition": {
+    "severity": ["high"],
+    "direction": "in"
+  }
+}
+```
+
+某主机下事件：
+
+```json
+{
+  "action": "events",
+  "asset_machine": "asset-123",
+  "time_from": 1741536000,
+  "time_to": 1741622400
+}
+```
+
+MDR 研判列表：
+
+```json
+{
+  "action": "list",
+  "time_from": 1741536000,
+  "time_to": 1741622400,
+  "condition": {
+    "judge_result_status": ["confirmed"]
+  }
+}
+```
+
+### 6. 脆弱性 / 弱口令 / 资产类查询
+
+常见思路：
+
+- 单接口工具通常直接传根级参数
+- 优先补齐根级 `time_from`、`time_to`
+- 若 tool 支持筛选和分页，再补 `condition`、`page`
+
+脆弱性示例：
+
+```json
+{
+  "time_from": 1741536000,
+  "time_to": 1741622400,
+  "page": {
+    "cur_page": 1,
+    "page_size": 20
+  },
+  "condition": {
+    "severity": ["3", "4"]
+  }
+}
+```
+
+服务资产列表示例：
+
+```json
+{
+  "action": "service_list",
+  "condition": {
+    "is_public": true,
+    "fuzzy": "nginx"
+  }
+}
+```
+
+登录入口列表示例：
+
+```json
+{
+  "action": "list",
+  "time_from": 1741536000,
+  "time_to": 1741622400,
+  "condition": {
+    "threat_tag": "weak_password"
+  }
+}
+```
+
+上传接口列表示例：
+
+```json
+{
+  "action": "interface_list",
+  "time_from": 1741536000,
+  "time_to": 1741622400,
+  "host": "example.com"
+}
+```
+
+API 风险列表示例：
+
+```json
+{
+  "time_from": 1741536000,
+  "time_to": 1741622400,
+  "condition": {
+    "api_risk_type": ["sql_injection"]
+  }
+}
+```
+
+资产类结果常看字段：
+
+- 名称
+- IP / 域名 / URL
+- 风险等级
+- 暴露状态
+- 关联主机数或命中次数
+
+### 7. 隐私拓扑、云服务与系统状态
+
+隐私拓扑示例：
+
+```json
+{
+  "time_from": 1741536000,
+  "time_to": 1741622400,
+  "condition": {
+    "itag": ["phone"],
+    "methods": ["POST"]
+  }
+}
+```
+
+云服务访问源示例：
+
+```json
+{
+  "action": "access_source",
+  "time_from": 1741536000,
+  "time_to": 1741622400,
+  "condition": {
+    "cloud_vendor": "aliyun"
+  }
+}
+```
+
+系统状态示例：
+
+```json
+{
+  "action": "database"
+}
+```
+
+### 8. 下载类接口
+
+PCAP 下载：
+
+```json
+{
+  "alert_id": "alert-123",
+  "occ_time": 1741622400
+}
+```
+
+恶意文件下载：
+
+```json
+{
+  "hash": "44d88612fea8a8f36de82e1278abb02f"
+}
+```
+
+注意：
+
+- 下载类接口会返回文件内容或触发真实下载语义
+- 若用户只是想确认“有没有文件/PCAP”，先查列表，不要直接下载
+
+### 9. 配置类接口边界
+
+`tdp_platform_config` 和 `tdp_policy_settings` 含大量写操作。
+
+只在以下情况下使用：
+
+- 用户明确要求查询或修改平台配置
+- 你已经确认 action、目标对象和影响范围
+- 涉及新增、编辑、删除、状态变更时，已得到用户明确授权
+
+示例，查询资产列表：
+
+```json
+{
+  "action": "asset_list"
+}
+```
+
+示例，查询处置日志：
+
+```json
+{
+  "action": "disposal_log_list"
+}
+```
+
+## 高风险与低风险
+
+TDP 这里大多数调查类 tool 是读操作，但以下情况仍要谨慎：
+
+- 下载类接口会触发真实文件下载
+- 某些查询会带较大时间范围，可能返回海量数据
+- `tdp_platform_config`、`tdp_policy_settings` 包含新增、编辑、删除、状态修改等高风险动作
+- 若用户只想“看看”，不要默认下载文件
+
+## 常见错误与回退规则
+
+- 缺少服务配置时，先检查 `tdp_api_key`、`tdp_secret`、`tdp_host`
+- 查询结果为空时，先检查api参数是否正确，尤其是时间范围，但尽量不要擅自修改用户查询条件
+- 写操作前要再次核对 action 是否为只读 list/search 还是 add/update/delete
+- 需要原始报文、PCAP、交互式详情时，先征得用户同意，再回退浏览器
+
+## 配合浏览器的边界
+
+先 API，再浏览器：
+
+- API 负责稳定取数
+- 浏览器负责页面详情、原始报文、下载入口、交互式下钻
+
+TDP 页面路径和浏览器技巧见：
+
+- [tdp-menu.md](tdp-menu.md)
+- [event-detail.md](event-detail.md)
+- [browser-workflow.md](browser-workflow.md)

@@ -1,0 +1,58 @@
+import axios from 'axios';
+
+// 部署时前后端同域，使用相对路径即可;开发时通过 .env 或 vite proxy 配置
+const baseURL = import.meta.env.VITE_API_BASE_URL || '';
+
+export const apiClient = axios.create({
+  baseURL,
+  timeout: 30000, // 30 seconds - 缩短超时时间以更快发现连接问题
+  headers: {
+    'Content-Type': 'application/json',
+  },
+});
+
+// 请求拦截器
+apiClient.interceptors.request.use(
+  (config) => {
+    // 可以在这里添加认证 token 等
+    return config;
+  },
+  (error) => {
+    return Promise.reject(error);
+  }
+);
+
+// 响应拦截器
+apiClient.interceptors.response.use(
+  (response) => {
+    return response;
+  },
+  (error) => {
+    const status = error.response?.status;
+    const url = error.config?.url || '';
+    const isExpectedMissingDefaultModel =
+      status === 404 && typeof url === 'string' && url.includes('/api/default-model/resolved');
+
+    if (isExpectedMissingDefaultModel) {
+      return Promise.reject(error);
+    }
+
+    // 统一错误处理
+    if (error.code === 'ECONNABORTED') {
+      console.error('API Timeout:', error.config?.url);
+    } else if (error.code === 'ERR_NETWORK') {
+      console.error('Network Error - Backend may be restarting:', error.config?.url);
+    } else {
+      console.error('API Error:', error.response?.data || error.message);
+    }
+    return Promise.reject(error);
+  }
+);
+
+/** Returns the configured API base URL (empty string means same origin). */
+export function getApiBase(): string {
+  return baseURL;
+}
+
+// 默认导出
+export default apiClient;

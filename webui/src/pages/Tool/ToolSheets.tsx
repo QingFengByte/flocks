@@ -1,0 +1,545 @@
+/**
+ * ToolSheets — 工具添加/生成的右侧抽屉组件
+ *
+ * - MCPSheet: 添加 MCP 服务（表单 + AI 对话）
+ * - APISheet: 添加 API 工具（表单 + AI 对话）
+ * - GenerateToolSheet: AI 生成自定义工具
+ */
+
+import { useState } from 'react';
+import { useTranslation } from 'react-i18next';
+import { Database, Cloud, Code, Info, CheckCircle, XCircle, Activity, Wifi, WifiOff, Loader2 } from 'lucide-react';
+import EntitySheet from '@/components/common/EntitySheet';
+import client from '@/api/client';
+import { mcpAPI } from '@/api/mcp';
+
+// ─── MCPSheet ─────────────────────────────────────────────────────────────────
+
+const MCP_REX_CONTEXT = `你是 MCP 服务接入专家，帮助用户将 MCP（Model Context Protocol）服务接入系统。
+
+**MCP 连接方式：**
+- Stdio（本地进程）：通过命令行启动本地 MCP 服务，如 npx、uvx、python 等
+- SSE（远程服务）：连接已部署的 MCP HTTP/SSE 服务
+
+**常见 MCP 服务示例：**
+- GitHub: \`npx -y @modelcontextprotocol/server-github\` (需要 GITHUB_TOKEN 环境变量)
+- Filesystem: \`npx -y @modelcontextprotocol/server-filesystem /path\`
+- Slack: \`npx -y @modelcontextprotocol/server-slack\`
+- Playwright: \`npx -y @modelcontextprotocol/server-playwright\`
+
+请帮助用户配置 MCP 服务，询问所需信息，并通过调用工具完成接入。`;
+
+const MCP_REX_WELCOME = `你好！我来帮你接入一个 MCP 服务。
+
+请告诉我：
+- 你想接入什么 MCP 服务？（GitHub、Slack、Filesystem、或其他）
+- 这个服务的连接方式是本地进程还是远程服务？
+
+我会帮你完成配置和接入。`;
+
+export interface MCPFormData {
+  name: string;
+  connType: 'stdio' | 'sse';
+  command: string;
+  args: string;
+  url: string;
+}
+
+export type ConnStatus = 'idle' | 'saving' | 'testing' | 'tested' | 'connected' | 'failed';
+
+export function buildMCPConfigFromForm(formData: MCPFormData): Record<string, any> {
+  const config: Record<string, any> = { type: formData.connType };
+  if (formData.connType === 'stdio') {
+    const args = formData.args
+      .split('\n')
+      .map((item) => item.trim())
+      .filter(Boolean);
+    const command = formData.command.trim();
+    config.command = command ? [command, ...args] : args;
+  } else {
+    config.url = formData.url.trim();
+  }
+  return config;
+}
+
+export function buildMCPFormDataFromConfig(
+  name: string,
+  config?: {
+    type?: 'stdio' | 'sse' | 'local' | 'remote';
+    command?: string | string[];
+    args?: string | string[];
+    url?: string;
+  } | null,
+  fallbackUrl?: string,
+): MCPFormData {
+  const connType = (config?.type ?? (fallbackUrl ? 'sse' : 'stdio')) as 'stdio' | 'sse';
+  const rawCommand = config?.command;
+  const commandParts = Array.isArray(rawCommand)
+    ? rawCommand.map((item) => String(item).trim()).filter(Boolean)
+    : (typeof rawCommand === 'string' && rawCommand.trim() ? [rawCommand.trim()] : []);
+  const rawArgs = config?.args;
+  const extraArgs = Array.isArray(rawArgs)
+    ? rawArgs.map((item) => String(item).trim()).filter(Boolean)
+    : (typeof rawArgs === 'string'
+      ? rawArgs.split('\n').map((item) => item.trim()).filter(Boolean)
+      : []);
+
+  return {
+    name,
+    connType,
+    command: connType === 'stdio' ? (commandParts[0] ?? '') : '',
+    args: connType === 'stdio' ? [...commandParts.slice(1), ...extraArgs].join('\n') : '',
+    url: connType === 'sse' ? (config?.url ?? fallbackUrl ?? '') : '',
+  };
+}
+
+interface MCPSheetProps {
+  onClose: () => void;
+  onSaved: () => void;
+  /** 静默刷新父组件列表，不关闭抽屉 */
+  onRefresh?: () => void;
+}
+
+function ConnStatusBadge({ status }: { status: ConnStatus }) {
+  const { t } = useTranslation('tool');
+  if (status === 'idle') return (
+    <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium bg-gray-100 text-gray-600">
+      <WifiOff className="w-3 h-3" />{t('sheet.connStatus.idle')}
+    </span>
+  );
+  if (status === 'saving') return (
+    <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium bg-red-100 text-red-700">
+      <Loader2 className="w-3 h-3 animate-spin" />{t('sheet.connStatus.saving')}
+    </span>
+  );
+  if (status === 'testing') return (
+    <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium bg-red-100 text-red-700">
+      <Activity className="w-3 h-3 animate-pulse" />{t('sheet.connStatus.testing')}
+    </span>
+  );
+  if (status === 'tested') return (
+    <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium bg-green-100 text-green-700">
+      <CheckCircle className="w-3 h-3" />{t('sheet.connStatus.tested')}
+    </span>
+  );
+  if (status === 'connected') return (
+    <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium bg-green-100 text-green-700">
+      <Wifi className="w-3 h-3" />{t('sheet.connStatus.connected')}
+    </span>
+  );
+  return (
+    <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium bg-red-100 text-red-700">
+      <WifiOff className="w-3 h-3" />{t('sheet.connStatus.failed')}
+    </span>
+  );
+}
+
+// ─── MCPFormFields（可复用表单内容）─────────────────────────────────────────
+
+interface MCPFormFieldsProps {
+  formData: MCPFormData;
+  /** 不传则为只读模式 */
+  onChange?: (fields: Partial<MCPFormData>) => void;
+  disabledFields?: Partial<Record<keyof MCPFormData, boolean>>;
+  connStatus: ConnStatus;
+  testResult: { success: boolean; message: string; tools_count?: number } | null;
+  onTestConnection: () => void;
+  isTesting: boolean;
+}
+
+export function MCPFormFields({
+  formData,
+  onChange,
+  disabledFields,
+  connStatus,
+  testResult,
+  onTestConnection,
+  isTesting,
+}: MCPFormFieldsProps) {
+  const { t } = useTranslation('tool');
+  const readOnly = !onChange;
+  const baseInputClass =
+    'w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-red-500';
+
+  const update = (fields: Partial<MCPFormData>) => onChange?.(fields);
+  const isFieldReadOnly = (field: keyof MCPFormData) => readOnly || !!disabledFields?.[field];
+  const inputClassFor = (field: keyof MCPFormData, extra = '') =>
+    `${baseInputClass}${isFieldReadOnly(field) ? ' bg-gray-50 text-gray-700 cursor-default' : ''}${extra ? ` ${extra}` : ''}`;
+
+  return (
+    <div className="space-y-4">
+      {/* 服务名称 + 状态 */}
+      <div>
+        <div className="flex items-center justify-between mb-1.5">
+          <label className="block text-sm font-medium text-gray-700">
+            {t('addMCP.serviceName')}{!readOnly && <span className="text-red-500"> *</span>}
+          </label>
+          <ConnStatusBadge status={connStatus} />
+        </div>
+        <input
+          type="text"
+          value={formData.name}
+          onChange={isFieldReadOnly('name') ? undefined : (e) => update({ name: e.target.value })}
+          readOnly={isFieldReadOnly('name')}
+          placeholder={t('addMCP.serviceNamePlaceholder')}
+          className={inputClassFor('name')}
+        />
+      </div>
+
+      {/* 连接方式 */}
+      <div>
+        <label className="block text-sm font-medium text-gray-700 mb-1.5">{t('addMCP.connectionType')}</label>
+        <div className="flex gap-4">
+          <label className={`flex items-center gap-2 ${isFieldReadOnly('connType') ? 'cursor-default' : 'cursor-pointer'}`}>
+            <input
+              type="radio"
+              value="stdio"
+              checked={formData.connType === 'stdio'}
+              onChange={isFieldReadOnly('connType') ? undefined : () => update({ connType: 'stdio' })}
+              disabled={isFieldReadOnly('connType')}
+              className="w-4 h-4 text-red-600 focus:ring-red-500"
+            />
+            <span className="text-sm text-gray-700">{t('addMCP.stdioLocal')}</span>
+          </label>
+          <label className={`flex items-center gap-2 ${isFieldReadOnly('connType') ? 'cursor-default' : 'cursor-pointer'}`}>
+            <input
+              type="radio"
+              value="sse"
+              checked={formData.connType === 'sse'}
+              onChange={isFieldReadOnly('connType') ? undefined : () => update({ connType: 'sse' })}
+              disabled={isFieldReadOnly('connType')}
+              className="w-4 h-4 text-red-600 focus:ring-red-500"
+            />
+            <span className="text-sm text-gray-700">{t('addMCP.remoteSSE')}</span>
+          </label>
+        </div>
+      </div>
+
+      {/* Stdio 字段 */}
+      {formData.connType === 'stdio' && (
+        <>
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1.5">
+              {t('addMCP.startCommand')}{!readOnly && <span className="text-red-500"> *</span>}
+            </label>
+            <input
+              type="text"
+              value={formData.command}
+              onChange={isFieldReadOnly('command') ? undefined : (e) => update({ command: e.target.value })}
+              readOnly={isFieldReadOnly('command')}
+              placeholder={t('addMCP.startCommandPlaceholder')}
+              className={inputClassFor('command', 'font-mono')}
+            />
+          </div>
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1.5">{t('addMCP.commandArgs')}</label>
+            <textarea
+              value={formData.args}
+              onChange={isFieldReadOnly('args') ? undefined : (e) => update({ args: e.target.value })}
+              readOnly={isFieldReadOnly('args')}
+              placeholder={t('addMCP.commandArgsPlaceholder')}
+              rows={3}
+              className={inputClassFor('args', 'font-mono')}
+            />
+            {!readOnly && <p className="mt-1 text-xs text-gray-500">{t('addMCP.oneArgPerLine')}</p>}
+          </div>
+        </>
+      )}
+
+      {/* SSE 字段：URL 输入框 + 测试连接按钮内联 */}
+      {formData.connType === 'sse' && (
+        <div>
+          <label className="block text-sm font-medium text-gray-700 mb-1.5">
+            {t('addMCP.serviceUrl')}{!readOnly && <span className="text-red-500"> *</span>}
+          </label>
+          <div className="flex gap-2">
+            <input
+              type="text"
+              value={formData.url}
+              onChange={isFieldReadOnly('url') ? undefined : (e) => update({ url: e.target.value })}
+              readOnly={isFieldReadOnly('url')}
+              placeholder={t('addMCP.serviceUrlPlaceholder')}
+              className={`${inputClassFor('url', 'font-mono')} flex-1 min-w-0`}
+            />
+            <button
+              type="button"
+              onClick={onTestConnection}
+              disabled={isTesting}
+              className="flex-shrink-0 inline-flex items-center gap-1.5 px-3 py-2 bg-white border border-gray-300 text-gray-700 rounded-lg hover:bg-gray-50 disabled:opacity-50 text-sm font-medium transition-colors whitespace-nowrap"
+            >
+              {isTesting ? (
+                <><Activity className="w-3.5 h-3.5 animate-pulse" />{t('detail.testingConn')}</>
+              ) : (
+                <><Activity className="w-3.5 h-3.5" />{t('detail.testConnection')}</>
+              )}
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Stdio：测试连接按钮独立一行 */}
+      {formData.connType === 'stdio' && (
+        <button
+          type="button"
+          onClick={onTestConnection}
+          disabled={isTesting}
+          className="inline-flex items-center gap-2 px-4 py-2 bg-white border border-gray-300 text-gray-700 rounded-lg hover:bg-gray-50 disabled:opacity-50 text-sm font-medium transition-colors"
+        >
+          {isTesting ? (
+            <><Activity className="w-4 h-4 animate-pulse" />{t('detail.testingConn')}</>
+          ) : (
+            <><Activity className="w-4 h-4" />{t('detail.testConnection')}</>
+          )}
+        </button>
+      )}
+
+      {/* 测试结果 */}
+      {testResult && (
+        <div className={`flex items-start gap-2 rounded-lg border p-3 text-sm ${
+          testResult.success ? 'bg-green-50 border-green-200 text-green-800' : 'bg-red-50 border-red-200 text-red-800'
+        }`}>
+          {testResult.success
+            ? <CheckCircle className="w-4 h-4 mt-0.5 flex-shrink-0" />
+            : <XCircle className="w-4 h-4 mt-0.5 flex-shrink-0" />
+          }
+          <span>{testResult.message}</span>
+        </div>
+      )}
+
+      {/* 提示（仅新建模式显示） */}
+      {!readOnly && (
+        <div className="flex items-start gap-2 p-3 bg-red-50 border border-red-200 rounded-lg">
+          <Info className="w-4 h-4 text-red-600 mt-0.5 flex-shrink-0" />
+          <p className="text-xs text-red-800">
+            {t('sheet.mcpHintDesc')}
+          </p>
+        </div>
+      )}
+    </div>
+  );
+}
+
+export function MCPSheet({ onClose, onSaved, onRefresh }: MCPSheetProps) {
+  const { t } = useTranslation('tool');
+  const [formData, setFormData] = useState<MCPFormData>({
+    name: '',
+    connType: 'sse',
+    command: '',
+    args: '',
+    url: '',
+  });
+  const [submitting, setSubmitting] = useState(false);
+  const [connStatus, setConnStatus] = useState<ConnStatus>('idle');
+  const [testResult, setTestResult] = useState<{
+    success: boolean;
+    message: string;
+    tools_count?: number;
+  } | null>(null);
+
+  const canSubmit = !!(formData.name.trim() &&
+    (formData.connType === 'stdio' ? formData.command.trim() : formData.url.trim()));
+
+  const handleSubmit = async () => {
+    if (!canSubmit || submitting) return;
+    try {
+      setSubmitting(true);
+      await client.post('/api/mcp', { name: formData.name, config: buildMCPConfigFromForm(formData) });
+      onSaved();
+    } catch (err: any) {
+      alert(t('alert.addFailed', { error: err.response?.data?.detail || err.message }));
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const update = (fields: Partial<MCPFormData>) => {
+    setFormData(prev => ({ ...prev, ...fields }));
+    // 表单变化时重置测试状态
+    if (connStatus !== 'idle') {
+      setConnStatus('idle');
+      setTestResult(null);
+    }
+  };
+
+  /** 仅测试连接，不保存到配置 */
+  const handleTestConnection = async () => {
+    if (!canSubmit || connStatus === 'testing') return;
+    setTestResult(null);
+    setConnStatus('testing');
+    try {
+      const res = await mcpAPI.test(formData.name, buildMCPConfigFromForm(formData));
+      const data = res.data;
+      const success = data.success ?? false;
+      setConnStatus(success ? 'tested' : 'failed');
+      setTestResult({
+        success,
+        message: data.message ?? (success ? t('sheet.connSuccess') : t('sheet.connFailed')),
+        tools_count: data.tools_count,
+      });
+    } catch (err: any) {
+      setConnStatus('failed');
+      setTestResult({
+        success: false,
+        message: err.response?.data?.detail ?? err.message ?? t('detail.testFailed'),
+      });
+    }
+  };
+
+  const isTesting = connStatus === 'testing';
+
+  return (
+    <EntitySheet
+      open
+      mode="create"
+      entityType={t('sheet.mcpEntityType')}
+      icon={<Database className="w-5 h-5" />}
+      rexSystemContext={MCP_REX_CONTEXT}
+      rexWelcomeMessage={MCP_REX_WELCOME}
+      submitDisabled={!canSubmit}
+      submitLoading={submitting}
+      submitLabel={t('button.addService')}
+      onClose={onClose}
+      onSubmit={handleSubmit}
+      initialTab="form"
+    >
+      <MCPFormFields
+        formData={formData}
+        onChange={update}
+        connStatus={connStatus}
+        testResult={testResult}
+        onTestConnection={handleTestConnection}
+        isTesting={isTesting}
+      />
+      {/* 测试后展示工具数/资源数（与详情页样式一致） */}
+      {testResult?.tools_count != null && (
+        <div className="grid grid-cols-2 gap-3">
+          <div className="rounded-lg border border-gray-200 bg-gray-50 px-3 py-2">
+            <div className="text-xs text-gray-500">{t('sheet.toolCountLabel')}</div>
+            <div className="text-lg font-semibold text-gray-900">{testResult.tools_count}</div>
+          </div>
+          <div className="rounded-lg border border-gray-200 bg-gray-50 px-3 py-2">
+            <div className="text-xs text-gray-500">{t('sheet.resourceCountLabel')}</div>
+            <div className="text-lg font-semibold text-gray-900">—</div>
+          </div>
+        </div>
+      )}
+    </EntitySheet>
+  );
+}
+
+// ─── APISheet ─────────────────────────────────────────────────────────────────
+
+const API_REX_CONTEXT = `你是 API 工具接入专家，帮助用户将外部 API 接入系统作为工具使用。
+
+**接入方式：**
+1. 了解 API 服务的功能和文档
+2. 帮助用户生成 API 工具代码（Python 函数）
+3. 将工具保存到系统中
+
+**支持的 API 类型：**
+- REST API（JSON 响应）
+- 需要 API Key 认证的服务
+- OpenAPI/Swagger 规范的服务
+
+请帮助用户接入 API 服务，必要时询问 API Key、Base URL 等信息。`;
+
+const API_REX_WELCOME = `你好！我来帮你接入一个 API 服务作为工具。
+
+请告诉我：
+- 你想接入什么 API？（ThreatBook、VirusTotal、OpenWeather 或其他）
+- API 的主要功能是什么？
+- 是否有 API Key 需要配置？
+
+我会帮你自动生成对应的工具代码并完成接入。
+
+如果你有 API 文档，请提供 API 文档链接或全文，我可以根据文档更准确地生成工具。`;
+
+interface APISheetProps {
+  onClose: () => void;
+}
+
+export function APISheet({ onClose }: APISheetProps) {
+  const { t } = useTranslation('tool');
+  const handleSubmit = () => {};
+
+  return (
+    <EntitySheet
+      open
+      mode="create"
+      entityType={t('sheet.apiEntityType')}
+      icon={<Cloud className="w-5 h-5" />}
+      rexSystemContext={API_REX_CONTEXT}
+      rexWelcomeMessage={API_REX_WELCOME}
+      submitDisabled
+      submitLabel={t('button.submitToRex')}
+      onClose={onClose}
+      onSubmit={handleSubmit}
+      hideForm
+      initialTab="rex"
+    >
+      <div />
+    </EntitySheet>
+  );
+}
+
+// ─── GenerateToolSheet ────────────────────────────────────────────────────────
+
+const GENERATE_REX_CONTEXT = `你是工具生成专家，帮助用户通过自然语言描述创建自定义工具。
+
+**工具生成流程：**
+1. 了解用户想要的工具功能
+2. 生成 Python 函数代码（符合工具接口规范）
+3. 将工具保存到系统中
+
+**工具规范：**
+- 工具是 Python 函数，需要有明确的参数类型注解和文档字符串
+- 函数名使用 snake_case
+- 返回值应该是 JSON 可序列化的对象
+
+请帮助用户生成工具代码，必要时询问更多细节。`;
+
+const GENERATE_REX_WELCOME = `你好！我来帮你生成一个自定义工具。
+
+请描述你想要的工具：
+- 这个工具做什么？（搜索、数据处理、API 调用、文件操作...）
+- 需要什么输入参数？
+- 期望什么格式的输出？
+
+描述越具体，生成的工具代码越准确。`;
+
+interface GenerateToolSheetProps {
+  onClose: () => void;
+}
+
+export function GenerateToolSheet({ onClose }: GenerateToolSheetProps) {
+  const { t } = useTranslation('tool');
+  const handleSubmit = () => {
+    onClose();
+  };
+
+  return (
+    <EntitySheet
+      open
+      mode="create"
+      entityType={t('sheet.generateEntityType')}
+      icon={<Code className="w-5 h-5" />}
+      rexSystemContext={GENERATE_REX_CONTEXT}
+      rexWelcomeMessage={GENERATE_REX_WELCOME}
+      submitLabel={t('sheet.doneLabel')}
+      onClose={onClose}
+      onSubmit={handleSubmit}
+    >
+      <div className="flex flex-col items-center justify-center py-12 gap-4 text-center">
+        <div className="w-16 h-16 rounded-2xl bg-red-50 flex items-center justify-center">
+          <Code className="w-8 h-8 text-red-500" />
+        </div>
+        <div>
+          <p className="text-sm font-medium text-gray-700 mb-1">{t('sheet.generateIntro')}</p>
+          <p className="text-xs text-gray-500">
+            {t('sheet.generateDesc')}
+          </p>
+        </div>
+      </div>
+    </EntitySheet>
+  );
+}

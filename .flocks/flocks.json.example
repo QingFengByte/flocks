@@ -1,0 +1,62 @@
+{
+
+  "provider": {},
+  "mcp": {},
+  "channels": {},
+  "api_services": {
+    "greynoise": {
+      "enabled": false
+    },
+    "ngtip_api": {
+      "enabled": false
+    },
+    "onesec_api": {
+      "enabled": false
+    },
+    "qingteng": {
+      "enabled": false
+    },
+    "skyeye_api": {
+      "enabled": false
+    },
+    "tdp_api": {
+      "enabled": false
+    },
+    "threatbook-cn": {
+      "enabled": false,
+      "base_url": "https://api.threatbook.cn"
+    },
+    "threatbook-io": {
+      "enabled": false,
+      "base_url": "https://api.threatbook.io"
+    },
+    "urlscan": {
+      "enabled": false
+    }
+  },
+  "sandbox": {
+    "mode": "off",
+    "scope": "agent",
+    "workspace_access": "rw",
+    "docker": {
+      "image": "python:slim",
+      "network": "bridge",
+      "memory": "1g",
+      "cpus": 1
+    },
+    "prune": {
+      "idle_hours": 12,
+      "max_age_days": 3
+    }
+  },
+  "updater": {
+    "enabled": true,
+    "repo": "AgentFlocks/flocks",
+    "gitee_repo": "flocks/flocks",
+    "sources": ["github", "gitee"],
+    "token": null,
+    "gitee_token": null,
+    "archive_format": "auto",
+    "backup_retain_count": 5
+  }
+}

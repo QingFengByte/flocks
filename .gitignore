@@ -1,0 +1,132 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual Environment (only at root, not in source code)
+/venv/
+/ENV/
+/env/
+/.venv
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.mypy_cache/
+.ruff_cache/
+
+# Logs
+*.log
+logs/
+*.log.*
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Secrets (API keys, credentials)
+.secret.json
+**/.secret.json
+**/secrets.json
+**/*secret*.json
+
+# Project specific
+*.db
+*.sqlite
+*.sqlite3
+vectordb/
+# storage/
+data/
+temp/
+tmp/
+.cache/
+.tmp-flocks
+
+# Flocks runtime (but keep config files)
+.flocks/data/
+.flocks/logs/
+.flocks/*.db
+.flocks/*.sqlite*
+.flocks/.DS_Store
+
+# User-specific configuration (keep only example files)
+.flocks/flocks.json
+.flocks/flocks.jsonc
+
+# Flocks built-in MCP servers
+.flocks/mcp_list.json
+.flocks/mcp_list.jsonc
+
+# Flocks plugins pycache (runtime-generated compiled files)
+.flocks/plugins/**/__pycache__/
+.flocks/plugins/**/*.py[cod]
+
+# Jupyter
+.ipynb_checkpoints
+*.ipynb
+
+# Documentation
+docs/_build/
+docs/*.md
+site/
+
+# Node.js (TUI)
+node_modules/
+tui/node_modules/
+bun.lockb
+.bun/
+docs/*
+!docs/CHANGELOG.md
+
+# TUI build
+tui/dist/
+
+# WebUI
+webui/node_modules/
+webui/dist/
+webui/.env
+webui/.env.local
+webui/.env.development.local
+webui/.env.production.local
+webui/.vite/deps/_metadata.json
+
+.flocks/.storage_migrated
+artifacts/
+prompt.txt
+CHANGELOG.md
+changelog.md
+
+# Integration tests with real host credentials (not for commit)
+tests/integration_ssh_*.py
+.cursor

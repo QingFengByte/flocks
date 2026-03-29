@@ -1,0 +1,365 @@
+{
+  "version": "1.0.0",
+  "updated_at": "2026-03-18",
+  "categories": {
+    "threat_intelligence": {
+      "label": "Threat Intelligence",
+      "description": "Threat intelligence platform integrations for malware, IP, domain, and URL indicator lookups"
+    },
+    "vulnerability": {
+      "label": "Vulnerability Management",
+      "description": "CVE/NVD and other vulnerability database queries and management"
+    },
+    "siem": {
+      "label": "SIEM & Log Analysis",
+      "description": "Security information and event management system integrations"
+    },
+    "network_security": {
+      "label": "Network Security",
+      "description": "Network scanning, asset discovery, and DNS analysis"
+    },
+    "code_security": {
+      "label": "Code Security",
+      "description": "Code vulnerability scanning, dependency checks, and security audits"
+    },
+    "reverse_engineering": {
+      "label": "Reverse Engineering",
+      "description": "Binary analysis, decompilation, and malware analysis"
+    },
+    "osint": {
+      "label": "OSINT",
+      "description": "Social media reconnaissance, profiling, and open-source intelligence gathering"
+    },
+    "cloud_security": {
+      "label": "Cloud Security",
+      "description": "Security assessment for AWS, Azure, Kubernetes, and other cloud platforms"
+    },
+    "compliance": {
+      "label": "Compliance",
+      "description": "CIS benchmarks, NIST, PCI-DSS, and other compliance checks"
+    },
+    "forensics": {
+      "label": "Digital Forensics",
+      "description": "Memory forensics, disk analysis, and chain of custody management"
+    },
+    "attack_framework": {
+      "label": "Attack Framework",
+      "description": "MITRE ATT&CK and other attack technique knowledge bases"
+    },
+    "data_pipeline": {
+      "label": "Data Processing",
+      "description": "Security data pipelines, encoding/decoding, and format conversion"
+    },
+    "firewall": {
+      "label": "Firewall & Network Devices",
+      "description": "Firewall rule management and network device configuration"
+    },
+    "secops_platform": {
+      "label": "SecOps Platform",
+      "description": "Unified security operations toolsets"
+    },
+    "identity_security": {
+      "label": "Identity Security",
+      "description": "IAM, key management, and authentication security"
+    }
+  },
+  "servers": [
+    {
+      "id": "threatbook_mcp",
+      "name": "ThreatBook MCP",
+      "description": "ThreatBook threat intelligence MCP service for IOC lookups, threat analysis, and security investigation workflows.",
+      "category": "threat_intelligence",
+      "github": "",
+      "language": "remote",
+      "license": "Proprietary",
+      "stars": 0,
+      "transport": "remote",
+      "env_vars": {
+        "THREATBOOK_MCP_KEY": {
+          "required": true,
+          "description": "ThreatBook MCP API Key",
+          "secret": true
+        }
+      },
+      "tags": [
+        "threat-intelligence",
+        "ioc",
+        "analysis"
+      ],
+      "official": true,
+      "description_cn": "微步威胁情报 MCP 服务，提供 IOC 查询、威胁情报研判与安全分析能力。"
+    },
+    {
+      "id": "nsfocus_mcp",
+      "name": "NSFOCUS MCP",
+      "description": "NSFOCUS threat analysis MCP service for security capability access, intelligence queries, and analyst-assisted investigation workflows.",
+      "category": "threat_intelligence",
+      "github": "",
+      "language": "remote",
+      "license": "Proprietary",
+      "stars": 0,
+      "transport": "remote",
+      "env_vars": {
+        "NSFOCUS_MCP_KEY": {
+          "required": true,
+          "description": "NSFOCUS MCP API Key",
+          "secret": true
+        }
+      },
+      "tags": [
+        "threat-intelligence",
+        "analysis",
+        "secops"
+      ],
+      "official": true,
+      "description_cn": "绿盟威胁分析 MCP 服务，提供安全能力调用、情报查询与分析辅助能力。"
+    },
+    {
+      "id": "qianxin_mcp",
+      "name": "QiAnXin MCP",
+      "description": "QiAnXin threat intelligence MCP service for intelligence lookups, threat analysis, and security operations support.",
+      "category": "threat_intelligence",
+      "github": "",
+      "language": "remote",
+      "license": "Proprietary",
+      "stars": 0,
+      "transport": "remote",
+      "env_vars": {
+        "QIANXIN_MCP_KEY": {
+          "required": true,
+          "description": "QiAnXin MCP API Key",
+          "secret": true
+        }
+      },
+      "tags": [
+        "threat-intelligence",
+        "ioc",
+        "secops"
+      ],
+      "official": true,
+      "description_cn": "奇安信威胁情报 MCP 服务，提供威胁情报查询、研判与安全运营支持能力。"
+    },
+    {
+      "id": "panther",
+      "name": "Panther SIEM",
+      "description": "Panther SIEM platform integration for writing detection rules with natural language, querying logs, and managing alerts.",
+      "category": "siem",
+      "github": "panther-labs/mcp-panther",
+      "language": "python",
+      "license": "AGPL-3.0",
+      "stars": 30,
+      "transport": "local",
+      "install": {
+        "pip": "mcp-panther",
+        "local_command": [
+          "python",
+          "-m",
+          "mcp_panther"
+        ]
+      },
+      "env_vars": {
+        "PANTHER_API_TOKEN": {
+          "required": true,
+          "description": "Panther API令牌",
+          "secret": true
+        },
+        "PANTHER_API_HOST": {
+          "required": true,
+          "description": "Panther API主机"
+        }
+      },
+      "tags": [
+        "siem",
+        "detection",
+        "log-analysis",
+        "alerts"
+      ],
+      "description_cn": "Panther SIEM 平台集成，支持用自然语言编写检测规则、查询日志并管理告警。"
+    },
+    {
+      "id": "secops",
+      "name": "SecOps Toolbox",
+      "description": "All-in-one security testing toolkit integrating multiple open-source security tools for penetration testing, vulnerability scanning, and threat hunting.",
+      "category": "secops_platform",
+      "github": "securityfortech/secops-mcp",
+      "language": "python",
+      "license": "MIT",
+      "stars": 25,
+      "transport": "local",
+      "install": {
+        "pip": "secops-mcp",
+        "local_command": [
+          "secops-mcp"
+        ]
+      },
+      "env_vars": {},
+      "tags": [
+        "pentest",
+        "bug-bounty",
+        "threat-hunting",
+        "all-in-one"
+      ],
+      "description_cn": "集成多种开源安全工具的一体化安全测试工具箱，用于渗透测试、漏洞扫描和威胁狩猎。"
+    },
+    {
+      "id": "tenzir",
+      "name": "Tenzir",
+      "description": "Tenzir security data pipeline engine integration with TQL queries, OCSF integration, and automated parser generation.",
+      "category": "data_pipeline",
+      "github": "tenzir/mcp",
+      "language": "python",
+      "license": "Apache-2.0",
+      "stars": 15,
+      "transport": "local",
+      "install": {
+        "pip": "tenzir-mcp",
+        "local_command": [
+          "tenzir-mcp"
+        ]
+      },
+      "env_vars": {
+        "TENZIR_ENDPOINT": {
+          "required": false,
+          "description": "Tenzir节点端点"
+        }
+      },
+      "tags": [
+        "pipeline",
+        "ocsf",
+        "tql",
+        "data-processing"
+      ],
+      "description_cn": "Tenzir 安全数据管道引擎集成，支持 TQL 查询、OCSF 集成和自动解析器生成。"
+    },
+    {
+      "id": "cybersec_watchdog",
+      "name": "CyberSec Watchdog",
+      "description": "Comprehensive Linux server security audit with 89 CIS benchmark controls and NIST 800-53 / PCI-DSS compliance checks.",
+      "category": "compliance",
+      "github": "girste/mcp-cybersec-watchdog",
+      "language": "python",
+      "license": "MIT",
+      "stars": 15,
+      "transport": "local",
+      "install": {
+        "pip": "mcp-cybersec-watchdog",
+        "local_command": [
+          "mcp-watchdog"
+        ]
+      },
+      "env_vars": {},
+      "tags": [
+        "cis",
+        "nist",
+        "pci-dss",
+        "compliance",
+        "audit"
+      ],
+      "description_cn": "面向 Linux 服务器的综合安全审计，内置 89 项 CIS 基准控制和 NIST 800-53 / PCI-DSS 合规检查。"
+    },
+    {
+      "id": "npm_audit",
+      "name": "NPM Security Audit",
+      "description": "NPM package dependency security audit using the remote npm registry for real-time security checks.",
+      "category": "code_security",
+      "github": "qianniuspace/mcp-security-audit",
+      "language": "typescript",
+      "license": "MIT",
+      "stars": 10,
+      "transport": "local",
+      "install": {
+        "npx": "mcp-security-audit",
+        "local_command": [
+          "npx",
+          "-y",
+          "mcp-security-audit"
+        ]
+      },
+      "env_vars": {},
+      "tags": [
+        "npm",
+        "dependency",
+        "audit",
+        "supply-chain"
+      ],
+      "description_cn": "基于远程 npm Registry 的 NPM 依赖安全审计，提供实时安全检查能力。"
+    },
+    {
+      "id": "gridinsoft",
+      "name": "GridinSoft Inspector",
+      "description": "Domain and URL security analysis for verifying website and link safety.",
+      "category": "threat_intelligence",
+      "github": "gridinsoft/mcp-inspector",
+      "language": "typescript",
+      "license": "MIT",
+      "stars": 5,
+      "transport": "local",
+      "install": {
+        "npx": "@gridinsoft/mcp-inspector",
+        "local_command": [
+          "npx",
+          "-y",
+          "@gridinsoft/mcp-inspector"
+        ]
+      },
+      "env_vars": {},
+      "tags": [
+        "url-analysis",
+        "domain",
+        "safety"
+      ],
+      "description_cn": "面向域名和 URL 的安全分析服务，用于验证网站和链接的安全性。"
+    },
+    {
+      "id": "chimera_csl",
+      "name": "Chimera CSL (Z3 Verification)",
+      "description": "Deterministic AI security policy engine using Z3 formal verification to write and enforce machine-verifiable AI constraints.",
+      "category": "compliance",
+      "github": "Chimera-Protocol/csl-core",
+      "language": "python",
+      "license": "MIT",
+      "stars": 10,
+      "transport": "local",
+      "install": {
+        "pip": "csl-core",
+        "local_command": [
+          "csl-core-mcp"
+        ]
+      },
+      "env_vars": {},
+      "tags": [
+        "formal-verification",
+        "z3",
+        "safety",
+        "constraints"
+      ],
+      "description_cn": "基于 Z3 形式化验证的确定性 AI 安全策略引擎，用于编写和执行可机器验证的 AI 约束。"
+    },
+    {
+      "id": "aim_guard",
+      "name": "AIM Guard",
+      "description": "Security-oriented MCP server providing security guidelines and content analysis for AI agents.",
+      "category": "secops_platform",
+      "github": "AIM-Intelligence/AIM-MCP",
+      "language": "typescript",
+      "license": "MIT",
+      "stars": 10,
+      "transport": "local",
+      "install": {
+        "npx": "aim-guard-mcp",
+        "local_command": [
+          "npx",
+          "-y",
+          "aim-guard-mcp"
+        ]
+      },
+      "env_vars": {},
+      "tags": [
+        "ai-safety",
+        "content-analysis",
+        "guidelines"
+      ],
+      "description_cn": "面向 AI Agent 的安全型 MCP 服务，提供安全规范与内容分析能力。"
+    }
+  ]
+}

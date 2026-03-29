@@ -1,0 +1,5 @@
+name: plan
+mode: subagent
+hidden: true
+delegatable: false
+# plan agent has access to question, plan_exit and restricted edit/external_directory

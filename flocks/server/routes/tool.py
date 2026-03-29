@@ -1,0 +1,761 @@
+"""
+Tool routes - API endpoints for tool management and execution
+"""
+
+from typing import List, Optional, Dict, Any
+from fastapi import APIRouter, HTTPException, status
+from pydantic import BaseModel, Field
+
+from flocks.utils.log import Log
+from flocks.config.config_writer import ConfigWriter
+from flocks.tool.registry import (
+    ToolRegistry,
+    ToolInfo,
+    ToolSchema,
+    ToolResult,
+    ToolCategory,
+)
+
+
+router = APIRouter()
+log = Log.create(service="tool-routes")
+
+
+# Request/Response Models
+
+class ToolInfoResponse(BaseModel):
+    """Tool information response"""
+    name: str = Field(..., description="Tool name")
+    description: str = Field(..., description="Tool description")
+    description_cn: Optional[str] = Field(None, description="Chinese UI description")
+    category: str = Field(..., description="Tool category")
+    source: str = Field("builtin", description="Tool source: builtin, mcp, api, custom")
+    source_name: Optional[str] = Field(None, description="Source detail, e.g. MCP server name or API module name")
+    parameters: List[Dict[str, Any]] = Field(default_factory=list, description="Tool parameters")
+    enabled: bool = Field(True, description="Is tool enabled")
+    requires_confirmation: bool = Field(False, description="Requires confirmation")
+
+
+class ToolSchemaResponse(BaseModel):
+    """Tool schema response"""
+    name: str = Field(..., description="Tool name")
+    schema_: Dict[str, Any] = Field(..., alias="schema", description="JSON Schema")
+
+
+class ToolUpdateRequest(BaseModel):
+    """Tool update request"""
+    enabled: bool = Field(..., description="Enable or disable the tool")
+
+
+class ToolExecuteRequest(BaseModel):
+    """Tool execution request"""
+    params: Dict[str, Any] = Field(default_factory=dict, description="Tool parameters")
+
+
+class ToolExecuteResponse(BaseModel):
+    """Tool execution response"""
+    success: bool = Field(..., description="Execution successful")
+    output: Any = Field(None, description="Output data")
+    error: Optional[str] = Field(None, description="Error message")
+    metadata: Dict[str, Any] = Field(default_factory=dict, description="Metadata")
+
+
+class BatchToolCall(BaseModel):
+    """Single tool call in batch"""
+    name: str = Field(..., description="Tool name")
+    params: Dict[str, Any] = Field(default_factory=dict, description="Tool parameters")
+
+
+class BatchExecuteRequest(BaseModel):
+    """Batch tool execution request"""
+    calls: List[BatchToolCall] = Field(..., description="Tool calls to execute")
+    parallel: bool = Field(True, description="Execute in parallel")
+
+
+class BatchExecuteResponse(BaseModel):
+    """Batch tool execution response"""
+    results: List[ToolExecuteResponse] = Field(..., description="Execution results")
+
+
+# Helper: determine tool source
+
+_BUILTIN_CATEGORIES = {
+    ToolCategory.FILE, ToolCategory.TERMINAL, ToolCategory.BROWSER,
+    ToolCategory.CODE, ToolCategory.SEARCH, ToolCategory.SYSTEM,
+}
+
+
+def _get_tool_source(tool_info: ToolInfo) -> tuple:
+    """
+    Determine tool source type and source name.
+    
+    Returns:
+        (source, source_name) tuple where source is one of:
+        'builtin', 'mcp', 'api', 'plugin_yaml', 'plugin_py', 'custom'
+    """
+    # Use ToolInfo.source field if explicitly set
+    if tool_info.source == "api":
+        return "api", tool_info.provider
+    if tool_info.source == "plugin_yaml":
+        return "plugin_yaml", tool_info.provider
+    if tool_info.source == "plugin_py":
+        return "plugin_py", None
+
+    # Check MCP source
+    try:
+        from flocks.mcp import MCP
+        if MCP.is_mcp_tool(tool_info.name):
+            source_info = MCP.get_tool_source(tool_info.name)
+            server_name = source_info.mcp_server if source_info else None
+            return "mcp", server_name
+    except Exception as e:
+        log.debug("tool.source_check.mcp_error", {"tool": tool_info.name, "error": str(e)})
+    
+    # Check if from dynamic/generated module (API tools)
+    for module_name, tool_names in ToolRegistry.get_dynamic_tools_by_module().items():
+        if tool_info.name in tool_names:
+            friendly_name = module_name.rsplit(".", 1)[-1] if "." in module_name else module_name
+            return "api", friendly_name
+    
+    # Builtin tools: recognized by non-CUSTOM categories
+    if tool_info.category in _BUILTIN_CATEGORIES:
+        return "builtin", "Flocks"
+    
+    # Default: custom
+    return "custom", None
+
+
+def _build_tool_response(t: ToolInfo) -> ToolInfoResponse:
+    """Build ToolInfoResponse with source info."""
+    source, source_name = _get_tool_source(t)
+    return ToolInfoResponse(
+        name=t.name,
+        description=t.description,
+        description_cn=t.description_cn,
+        category=t.category.value,
+        source=source,
+        source_name=source_name,
+        parameters=[p.model_dump() for p in t.parameters],
+        enabled=_get_effective_tool_enabled(t),
+        requires_confirmation=t.requires_confirmation,
+    )
+
+
+def _get_effective_tool_enabled(tool_info: ToolInfo) -> bool:
+    """Compute tool enabled state without mutating the registry object."""
+    source, source_name = _get_tool_source(tool_info)
+    if source != "api" or not source_name:
+        return tool_info.enabled
+    from flocks.server.routes.provider import _get_api_service_enabled
+
+    return tool_info.enabled and _get_api_service_enabled(source_name)
+
+
+# Routes
+
+@router.get(
+    "",
+    response_model=List[ToolInfoResponse],
+    summary="List all tools",
+)
+async def list_tools(
+    category: Optional[str] = None,
+    source: Optional[str] = None,
+):
+    """
+    List all available tools
+    
+    Args:
+        category: Optional category filter (file, terminal, browser, etc.)
+        source: Optional source filter (builtin, mcp, api, custom)
+        
+    Returns:
+        List of tool information
+    """
+    # Initialize registry if needed
+    ToolRegistry.init()
+    
+    # Parse category filter
+    cat_filter = None
+    if category:
+        try:
+            cat_filter = ToolCategory(category)
+        except ValueError:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Invalid category: {category}"
+            )
+    
+    tools = ToolRegistry.list_tools(category=cat_filter)
+    result = [_build_tool_response(t) for t in tools]
+    
+    # Apply source filter if specified
+    if source:
+        result = [t for t in result if t.source == source]
+    
+    return result
+
+
+@router.get(
+    "/{tool_name}",
+    response_model=ToolInfoResponse,
+    summary="Get tool details",
+)
+async def get_tool(tool_name: str):
+    """
+    Get tool information by name
+    
+    Args:
+        tool_name: Tool name
+        
+    Returns:
+        Tool information
+    """
+    ToolRegistry.init()
+    
+    tool = ToolRegistry.get(tool_name)
+    if not tool:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Tool not found: {tool_name}"
+        )
+
+    return _build_tool_response(tool.info)
+
+
+@router.patch(
+    "/{tool_name}",
+    response_model=ToolInfoResponse,
+    summary="Update tool settings",
+)
+async def update_tool(tool_name: str, request: ToolUpdateRequest):
+    """
+    Update tool settings (e.g., enable or disable)
+
+    Args:
+        tool_name: Tool name
+        request: Update payload
+
+    Returns:
+        Updated tool information
+    """
+    ToolRegistry.init()
+
+    tool = ToolRegistry.get(tool_name)
+    if not tool:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Tool not found: {tool_name}",
+        )
+
+    source, source_name = _get_tool_source(tool.info)
+    if source == "api" and source_name:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"API tool '{tool_name}' must be managed via its API service",
+        )
+
+    tool.info.enabled = request.enabled
+    log.info("tool.updated", {"name": tool_name, "enabled": request.enabled})
+    return _build_tool_response(tool.info)
+
+
+@router.get(
+    "/{tool_name}/schema",
+    response_model=ToolSchemaResponse,
+    summary="Get tool schema",
+)
+async def get_tool_schema(tool_name: str):
+    """
+    Get JSON Schema for a tool
+    
+    Args:
+        tool_name: Tool name
+        
+    Returns:
+        Tool JSON Schema
+    """
+    ToolRegistry.init()
+    
+    schema = ToolRegistry.get_schema(tool_name)
+    if not schema:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Tool not found: {tool_name}"
+        )
+    
+    return ToolSchemaResponse(
+        name=tool_name,
+        schema=schema.to_json_schema(),
+    )
+
+
+@router.post(
+    "/{tool_name}/execute",
+    response_model=ToolExecuteResponse,
+    summary="Execute a tool",
+)
+async def execute_tool(tool_name: str, request: ToolExecuteRequest):
+    """
+    Execute a tool with given parameters
+    
+    Args:
+        tool_name: Tool name
+        request: Execution parameters
+        
+    Returns:
+        Execution result
+    """
+    ToolRegistry.init()
+    
+    tool = ToolRegistry.get(tool_name)
+    if not tool:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Tool not found: {tool_name}"
+        )
+
+    if not _get_effective_tool_enabled(tool.info):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"Tool is disabled: {tool_name}"
+        )
+    
+    log.info("tool.execute.request", {
+        "tool": tool_name,
+        "params": list(request.params.keys()),
+    })
+    
+    result = await ToolRegistry.execute(tool_name=tool_name, **request.params)
+    
+    return ToolExecuteResponse(
+        success=result.success,
+        output=result.output,
+        error=result.error,
+        metadata=result.metadata,
+    )
+
+
+@router.post(
+    "/batch",
+    response_model=BatchExecuteResponse,
+    summary="Execute multiple tools",
+)
+async def execute_batch(request: BatchExecuteRequest):
+    """
+    Execute multiple tools in batch
+    
+    Args:
+        request: Batch execution request
+        
+    Returns:
+        List of execution results
+    """
+    ToolRegistry.init()
+    
+    # Validate all tools exist
+    for call in request.calls:
+        tool = ToolRegistry.get(call.name)
+        if not tool:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Tool not found: {call.name}"
+            )
+    
+    log.info("tool.batch.request", {
+        "count": len(request.calls),
+        "parallel": request.parallel,
+    })
+    
+    # Execute batch
+    calls = [{"name": c.name, "params": c.params} for c in request.calls]
+    results = await ToolRegistry.execute_batch(calls, parallel=request.parallel)
+    
+    return BatchExecuteResponse(
+        results=[
+            ToolExecuteResponse(
+                success=r.success,
+                output=r.output,
+                error=r.error,
+                metadata=r.metadata,
+            )
+            for r in results
+        ]
+    )
+
+
+class RefreshResponse(BaseModel):
+    """Tool refresh response"""
+    status: str = Field(..., description="Operation status")
+    tool_count: int = Field(..., description="Total registered tool count after refresh")
+    message: str = Field("", description="Human-readable summary")
+
+
+@router.post(
+    "/refresh",
+    response_model=RefreshResponse,
+    summary="Refresh all plugin and dynamic tools",
+)
+async def refresh_tools():
+    """
+    Reload all plugin tools (YAML + Python) and dynamically generated tools
+    from disk without restarting the service.
+
+    This is the batch counterpart to the single-tool ``/{name}/reload`` endpoint.
+    """
+    ToolRegistry.init()
+
+    errors: list[str] = []
+
+    # 1. Reload generated tools (generated/)
+    try:
+        ToolRegistry.refresh_dynamic_tools()
+    except Exception as e:
+        log.error("tools.refresh.dynamic_error", {"error": str(e)})
+        errors.append(f"dynamic: {e}")
+
+    # 2. Reload plugin tools (api/, python/) — unregisters stale entries first
+    try:
+        ToolRegistry.refresh_plugin_tools()
+    except Exception as e:
+        log.error("tools.refresh.plugin_error", {"error": str(e)})
+        errors.append(f"plugin: {e}")
+
+    tool_count = len(ToolRegistry.all_tool_ids())
+    log.info("tools.refresh.done", {"tool_count": tool_count, "errors": len(errors)})
+
+    if errors:
+        return RefreshResponse(
+            status="partial",
+            tool_count=tool_count,
+            message=f"Refreshed with {len(errors)} error(s): {'; '.join(errors)}",
+        )
+
+    return RefreshResponse(
+        status="success",
+        tool_count=tool_count,
+        message=f"All tools refreshed successfully ({tool_count} tools registered)",
+    )
+
+
+# =============================================================================
+# WebUI Enhancement Routes
+# =============================================================================
+
+class ToolTestRequest(BaseModel):
+    """Request to test a tool"""
+    params: Dict[str, Any] = Field(default_factory=dict, description="Test parameters")
+
+
+@router.post(
+    "/{name}/test",
+    response_model=ToolExecuteResponse,
+    summary="Test tool",
+)
+async def test_tool(name: str, request: ToolTestRequest):
+    """
+    Test a tool
+    
+    Executes the tool with provided test parameters and returns the result.
+    """
+    ToolRegistry.init()
+    
+    tool = ToolRegistry.get(name)
+    if not tool:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Tool not found: {name}"
+        )
+    
+    log.info("tool.test", {"name": name, "params": request.params})
+    
+    # Execute tool
+    try:
+        result = await ToolRegistry.execute(tool_name=name, **request.params)
+        return ToolExecuteResponse(
+            success=result.success,
+            output=result.output,
+            error=result.error,
+            metadata=result.metadata,
+        )
+    except Exception as e:
+        log.error("tool.test.error", {"name": name, "error": str(e)})
+        return ToolExecuteResponse(
+            success=False,
+            output=None,
+            error=str(e),
+            metadata={},
+        )
+
+
+# =============================================================================
+# Plugin Tool CRUD Routes
+# =============================================================================
+
+class CreateToolRequest(BaseModel):
+    """Request to create a YAML plugin tool"""
+    name: str = Field(..., description="Tool name (snake_case)")
+    description: str = Field("", description="Tool description")
+    category: str = Field("custom", description="Tool category")
+    provider: Optional[str] = Field(None, description="Provider name for grouping")
+    enabled: bool = Field(True, description="Is tool enabled")
+    requires_confirmation: bool = Field(False, description="Requires user confirmation")
+    inputSchema: Optional[Dict[str, Any]] = Field(None, description="MCP-compatible JSON Schema")
+    parameters: Optional[List[Dict[str, Any]]] = Field(None, description="Simplified parameter list")
+    handler: Dict[str, Any] = Field(..., description="Handler config (type: http|script)")
+    response: Optional[Dict[str, Any]] = Field(None, description="Response processing config")
+
+
+class UpdateToolRequest(BaseModel):
+    """Request to update a YAML plugin tool"""
+    description: Optional[str] = Field(None)
+    category: Optional[str] = Field(None)
+    enabled: Optional[bool] = Field(None)
+    requires_confirmation: Optional[bool] = Field(None)
+    inputSchema: Optional[Dict[str, Any]] = Field(None)
+    parameters: Optional[List[Dict[str, Any]]] = Field(None)
+    handler: Optional[Dict[str, Any]] = Field(None)
+    response: Optional[Dict[str, Any]] = Field(None)
+
+
+class PluginToolListResponse(BaseModel):
+    """Response listing YAML plugin tools"""
+    tools: List[Dict[str, Any]] = Field(default_factory=list)
+
+
+@router.post(
+    "",
+    response_model=ToolInfoResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Create a YAML plugin tool",
+)
+async def create_tool(request: CreateToolRequest):
+    """
+    Create a new tool via YAML plugin.
+
+    The tool is written to ``~/.flocks/plugins/tools/api/`` (or a provider
+    subdirectory ``api/{provider}/`` if specified), then loaded into the
+    ToolRegistry immediately.
+    """
+    from flocks.tool.tool_loader import (
+        create_yaml_tool,
+        yaml_to_tool,
+        TOOL_TYPE_API,
+    )
+
+    ToolRegistry.init()
+
+    data: Dict[str, Any] = {
+        "name": request.name,
+        "description": request.description,
+        "category": request.category,
+        "enabled": request.enabled,
+        "requires_confirmation": request.requires_confirmation,
+        "handler": request.handler,
+    }
+    if request.inputSchema:
+        data["inputSchema"] = request.inputSchema
+    if request.parameters:
+        data["parameters"] = request.parameters
+    if request.response:
+        data["response"] = request.response
+    if request.provider:
+        data["provider"] = request.provider
+
+    try:
+        yaml_path = create_yaml_tool(data, provider=request.provider, tool_type=TOOL_TYPE_API)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
+    except Exception as e:
+        log.error("tool.create.error", {"error": str(e)})
+        raise HTTPException(status_code=500, detail=str(e))
+
+    try:
+        tool = yaml_to_tool(data, yaml_path)
+        if not tool.info.source:
+            tool.info.source = "plugin_yaml"
+        if request.provider:
+            tool.info.provider = request.provider
+        ToolRegistry.register(tool)
+        if tool.info.name not in ToolRegistry._plugin_tool_names:
+            ToolRegistry._plugin_tool_names.append(tool.info.name)
+    except Exception as e:
+        log.error("tool.create.register_error", {"error": str(e), "name": request.name})
+        raise HTTPException(
+            status_code=500,
+            detail=f"Tool file created but failed to register: {e}",
+        )
+
+    if request.provider and request.enabled:
+        from flocks.server.routes.provider import (
+            APIServiceUpdateRequest,
+            update_api_service,
+        )
+
+        await update_api_service(
+            request.provider,
+            APIServiceUpdateRequest(enabled=True),
+        )
+
+    return _build_tool_response(tool.info)
+
+
+@router.put(
+    "/{name}",
+    response_model=ToolInfoResponse,
+    summary="Update a YAML plugin tool",
+)
+async def update_plugin_tool(name: str, request: UpdateToolRequest):
+    """
+    Update an existing YAML plugin tool.
+
+    Only YAML-based plugin tools can be updated. Built-in and MCP tools
+    cannot be modified through this endpoint.
+    """
+    from flocks.tool.tool_loader import (
+        find_yaml_tool,
+        update_yaml_tool,
+        yaml_to_tool,
+        _read_yaml_raw,
+    )
+
+    ToolRegistry.init()
+
+    if not find_yaml_tool(name):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"YAML plugin tool not found: {name}",
+        )
+
+    updates = {k: v for k, v in request.model_dump().items() if v is not None}
+    if not updates:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No updates provided",
+        )
+
+    try:
+        if not update_yaml_tool(name, updates):
+            raise HTTPException(status_code=500, detail=f"Failed to update YAML for tool {name}")
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.error("tool.update.error", {"error": str(e), "name": name})
+        raise HTTPException(status_code=500, detail=str(e))
+
+    # Reload tool into registry
+    try:
+        yaml_path = find_yaml_tool(name)
+        if yaml_path:
+            raw = _read_yaml_raw(yaml_path)
+            tool = yaml_to_tool(raw, yaml_path)
+            if not tool.info.source:
+                tool.info.source = "plugin_yaml"
+            ToolRegistry.register(tool)
+            return _build_tool_response(tool.info)
+    except Exception as e:
+        log.error("tool.update.reload_error", {"error": str(e), "name": name})
+
+    existing = ToolRegistry.get(name)
+    if existing:
+        return _build_tool_response(existing.info)
+    raise HTTPException(status_code=500, detail="Tool updated but reload failed")
+
+
+@router.delete(
+    "/{name}",
+    summary="Delete a plugin tool",
+)
+async def delete_tool(name: str):
+    """
+    Delete a plugin tool.
+
+    Supports YAML plugin tools and Python plugin tools. Built-in and MCP
+    tools cannot be removed through this endpoint.
+    """
+    from flocks.tool.tool_loader import delete_yaml_tool, delete_python_tool, find_yaml_tool
+
+    ToolRegistry.init()
+
+    deleted = False
+    if find_yaml_tool(name):
+        try:
+            deleted = delete_yaml_tool(name)
+        except Exception as e:
+            log.error("tool.delete.error", {"error": str(e), "name": name})
+            raise HTTPException(status_code=500, detail=str(e))
+    else:
+        try:
+            deleted = delete_python_tool(name)
+        except Exception as e:
+            log.error("tool.delete.error", {"error": str(e), "name": name})
+            raise HTTPException(status_code=500, detail=str(e))
+
+    if not deleted:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Plugin tool not found: {name}",
+        )
+
+    # Refresh plugin tools so stale decorator-registered python tools are removed too.
+    ToolRegistry.refresh_plugin_tools()
+
+    return {"status": "success", "message": f"Tool {name} deleted"}
+
+
+@router.post(
+    "/{name}/reload",
+    response_model=ToolInfoResponse,
+    summary="Reload a YAML plugin tool",
+)
+async def reload_tool(name: str):
+    """
+    Hot-reload a single YAML plugin tool.
+
+    Re-reads the YAML file from disk and re-registers the tool
+    in the ToolRegistry without restarting the service.
+    """
+    from flocks.tool.tool_loader import find_yaml_tool, yaml_to_tool, _read_yaml_raw
+
+    ToolRegistry.init()
+
+    yaml_path = find_yaml_tool(name)
+    if not yaml_path:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"YAML plugin tool not found: {name}",
+        )
+
+    try:
+        raw = _read_yaml_raw(yaml_path)
+        tool = yaml_to_tool(raw, yaml_path)
+        if not tool.info.source:
+            tool.info.source = "plugin_yaml"
+        ToolRegistry.register(tool)
+        log.info("tool.reloaded", {"name": name})
+        return _build_tool_response(tool.info)
+    except Exception as e:
+        log.error("tool.reload.error", {"error": str(e), "name": name})
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get(
+    "/plugin/list",
+    response_model=PluginToolListResponse,
+    summary="List YAML plugin tools",
+)
+async def list_plugin_tools():
+    """
+    List all YAML plugin tools with metadata.
+
+    Returns tools discovered from ``~/.flocks/plugins/tools/`` including
+    provider subdirectories.
+    """
+    from flocks.tool.tool_loader import list_yaml_tools
+
+    try:
+        tools = list_yaml_tools()
+        return PluginToolListResponse(tools=tools)
+    except Exception as e:
+        log.error("tool.plugin.list.error", {"error": str(e)})
+        raise HTTPException(status_code=500, detail=str(e))
