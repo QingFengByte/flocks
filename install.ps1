@@ -8,7 +8,8 @@ $ErrorActionPreference = "Stop"
 
 $RepoSlug = if ([string]::IsNullOrWhiteSpace($env:FLOCKS_REPO_SLUG)) { "AgentFlocks/Flocks" } else { $env:FLOCKS_REPO_SLUG }
 $DefaultBranch = if ([string]::IsNullOrWhiteSpace($env:FLOCKS_DEFAULT_BRANCH)) { "main" } else { $env:FLOCKS_DEFAULT_BRANCH }
-$InstallDir = if ([string]::IsNullOrWhiteSpace($env:FLOCKS_INSTALL_DIR)) { Join-Path $HOME ".flocks\app" } else { $env:FLOCKS_INSTALL_DIR }
+$DefaultInstallDir = Join-Path (Get-Location) "flocks"
+$InstallDir = if ([string]::IsNullOrWhiteSpace($env:FLOCKS_INSTALL_DIR)) { $DefaultInstallDir } else { $env:FLOCKS_INSTALL_DIR }
 
 if ([string]::IsNullOrWhiteSpace($Version)) {
     $Version = $DefaultBranch
@@ -29,8 +30,9 @@ function Show-Usage {
     Write-Host "Usage: install.ps1 [-InstallTui] [-Version <tag-or-branch>] [-Help]"
     Write-Host ""
     Write-Host "Bootstrap installer for Flocks."
-Write-Host "This script downloads the GitHub source archive to a temporary directory,"
-Write-Host "copies it to a stable install location, and delegates to scripts/install.ps1."
+    Write-Host "This script downloads the GitHub source archive to a temporary directory,"
+    Write-Host "copies it to a persistent install location, and delegates to scripts/install.ps1."
+    Write-Host "By default it creates a 'flocks' subdirectory under the current directory."
     Write-Host ""
     Write-Host "Options:"
     Write-Host "  -InstallTui          Also install TUI dependencies."

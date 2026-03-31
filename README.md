@@ -48,13 +48,14 @@ If automatic `npm` installation fails during setup, please install `npm` manuall
 
 > **Users in mainland China**: If GitHub or `raw.githubusercontent.com` is slow or unreachable, clone from a Gitee mirror and follow the Source install instructions below.
 
-The recommended host installation entrypoint is the GitHub bootstrap installer. It downloads the repository source archive to a temporary directory, copies it into a persistent local install directory, then installs backend and WebUI dependencies and exposes the `flocks` CLI on your PATH.
+The recommended host installation entrypoint is the GitHub bootstrap installer. It downloads the repository source archive to a temporary directory, copies it into a `flocks/` subdirectory under your current working directory by default, then installs backend and WebUI dependencies and exposes the `flocks` CLI on your PATH. You can still override the destination with `FLOCKS_INSTALL_DIR`.
 
 #### macOS / Linux
 
 ```bash
 # One-click install backend + WebUI
 curl -fsSL https://raw.githubusercontent.com/AgentFlocks/Flocks/main/install.sh | bash
+# Creates ./flocks under the current directory
 
 # Optional: also install TUI dependencies
 curl -fsSL https://raw.githubusercontent.com/AgentFlocks/Flocks/main/install.sh | bash -s -- --with-tui
@@ -65,6 +66,7 @@ curl -fsSL https://raw.githubusercontent.com/AgentFlocks/Flocks/main/install.sh 
 ```powershell
 # One-click install backend + WebUI
 iwr -useb https://raw.githubusercontent.com/AgentFlocks/Flocks/main/install.ps1 | iex
+# Creates .\flocks under the current directory
 
 # Optional: also install TUI dependencies
 & ([scriptblock]::Create((iwr -useb https://raw.githubusercontent.com/AgentFlocks/Flocks/main/install.ps1))) -InstallTui

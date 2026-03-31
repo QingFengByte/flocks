@@ -53,6 +53,7 @@ Flocks 支持两种部署方式：
 ```bash
 # 一键安装后端 + WebUI
 curl -fsSL https://raw.githubusercontent.com/AgentFlocks/Flocks/main/install.sh | bash
+# 默认会在当前目录下创建 ./flocks
 
 # 可选：同时安装 TUI 依赖
 curl -fsSL https://raw.githubusercontent.com/AgentFlocks/Flocks/main/install.sh | bash -s -- --with-tui
@@ -63,6 +64,7 @@ curl -fsSL https://raw.githubusercontent.com/AgentFlocks/Flocks/main/install.sh 
 ```powershell
 # 一键安装后端 + WebUI
 iwr -useb https://raw.githubusercontent.com/AgentFlocks/Flocks/main/install.ps1 | iex
+# 默认会在当前目录下创建 .\flocks
 
 # 可选：同时安装 TUI 依赖
 & ([scriptblock]::Create((iwr -useb https://raw.githubusercontent.com/AgentFlocks/Flocks/main/install.ps1))) -InstallTui

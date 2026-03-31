@@ -9,7 +9,8 @@ DEFAULT_BRANCH="${FLOCKS_DEFAULT_BRANCH:-main}"
 VERSION="${VERSION:-$DEFAULT_BRANCH}"
 INSTALL_TUI=0
 TMP_DIR=""
-INSTALL_DIR="${FLOCKS_INSTALL_DIR:-$HOME/.flocks/app}"
+DEFAULT_INSTALL_DIR="${PWD%/}/flocks"
+INSTALL_DIR="${FLOCKS_INSTALL_DIR:-$DEFAULT_INSTALL_DIR}"
 
 info() {
   printf '[flocks-bootstrap] %s\n' "$1"
@@ -36,8 +37,9 @@ Usage: install.sh [--with-tui] [--version <tag-or-branch>]
 
 Bootstrap installer for Flocks.
 This script downloads the GitHub source archive, extracts it to a temporary
-directory, copies it to a stable install location, then delegates to
-scripts/install.sh inside the repository.
+directory, copies it to a persistent install location, then delegates to
+scripts/install.sh inside the repository. By default it creates a "flocks"
+subdirectory under the current working directory.
 
 Options:
   --with-tui, -t         Also install TUI dependencies.
