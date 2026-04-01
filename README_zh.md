@@ -118,6 +118,7 @@ docker pull ghcr.io/agentflocks/flocks:latest
 # macOS / Linux
 docker run -d \
   --name flocks \
+  -e TZ=Asia/Shanghai \
   -p 8000:8000 \
   -p 5173:5173 \
   --shm-size 2gb \
@@ -129,6 +130,7 @@ docker run -d \
 # Windows PowerShell
 docker run -d `
   --name flocks `
+  -e TZ=Asia/Shanghai `
   -p 8000:8000 `
   -p 5173:5173 `
   --shm-size 2gb `
@@ -156,6 +158,21 @@ url = "https://pypi.tuna.tsinghua.edu.cn/simple"
 url = "https://pypi.org/simple"
 default = true
 ```
+
+### Docker 问题
+
+启动后 `/home/flocks/.flocks` 权限问题
+
+``` bash
+-v "$HOME/.flocks:/home/flocks/.flocks:Z" \
+```
+
+### 远程访问 Flocks 服务
+```bash
+__VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS=<your_domain> \
+flocks start --server-host 127.0.0.1 --webui-host 0.0.0.0
+```
+虚拟机远程访问失败请指定 host 为虚拟机 IP。
 
 ## 加入社区
 
