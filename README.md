@@ -161,6 +161,21 @@ url = "https://pypi.org/simple"
 default = true
 ```
 
+### Docker Issues
+
+Permission issues for `/home/flocks/.flocks` after startup:
+
+``` bash
+-v "$HOME/.flocks:/home/flocks/.flocks:Z" \
+```
+
+### Remote Access to Flocks Service
+```bash
+__VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS=<your_domain> \
+flocks start --server-host 127.0.0.1 --webui-host 0.0.0.0
+```
+If remote access from a virtual machine fails, please specify the host as the virtual machine's IP.
+
 ## Join our community
 
 Scan the QR code with **WeChat** to join our official discussion group.  
