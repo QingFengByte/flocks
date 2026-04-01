@@ -41,6 +41,28 @@ async def test_run_async_handles_none_process_output(
     assert stderr == ""
 
 
+@pytest.mark.asyncio
+async def test_run_async_replaces_invalid_windows_bytes(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    def fake_run(*args, **kwargs):
+        return subprocess.CompletedProcess(
+            args=args[0],
+            returncode=0,
+            stdout=b"ok\x93done",
+            stderr=b"",
+        )
+
+    monkeypatch.setattr(updater.subprocess, "run", fake_run)
+
+    code, stdout, stderr = await updater._run_async(["npm", "run", "build"], cwd=tmp_path)
+
+    assert code == 0
+    assert stdout == "ok�done"
+    assert stderr == ""
+
+
 def test_find_executable_checks_windows_scripts_dir(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -86,6 +108,33 @@ def test_upgrade_page_probe_urls_support_ipv6_loopback_fallback() -> None:
     ]
 
 
+def test_build_restart_argv_uses_windows_executable_shim(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(updater.sys, "platform", "win32")
+    monkeypatch.setattr(updater.sys, "executable", r"C:\Python312\python.exe")
+    monkeypatch.setattr(
+        updater.sys,
+        "argv",
+        [r"C:\Users\worker\.local\bin\flocks", "start", "--reload", "--port", "8000"],
+    )
+    monkeypatch.setattr(
+        updater.shutil,
+        "which",
+        lambda name: r"C:\Users\worker\.local\bin\flocks.exe" if name in {
+            r"C:\Users\worker\.local\bin\flocks",
+            r"C:\Users\worker\.local\bin\flocks.exe",
+        } else None,
+    )
+
+    assert updater._build_restart_argv() == [
+        r"C:\Users\worker\.local\bin\flocks.exe",
+        "start",
+        "--port",
+        "8000",
+    ]
+
+
 def test_rmtree_onerror_retries_before_logging_skip(monkeypatch: pytest.MonkeyPatch) -> None:
     attempts: list[str] = []
     warnings: list[tuple[str, dict[str, str]]] = []
@@ -124,6 +173,26 @@ def test_safe_remove_renames_locked_file_on_windows(monkeypatch: pytest.MonkeyPa
     leftovers = list(tmp_path.glob("locked.exe.flocks_old_*"))
     assert not target.exists()
     assert len(leftovers) == 1
+
+
+def test_safe_remove_renames_locked_directory_on_windows(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "webui"
+    target.mkdir()
+    (target / "dist").mkdir()
+    (target / "dist" / "index.html").write_text("old", encoding="utf-8")
+
+    monkeypatch.setattr(updater.sys, "platform", "win32")
+    monkeypatch.setattr(updater, "_safe_rmtree", lambda _target: (_ for _ in ()).throw(PermissionError("locked")))
+
+    updater._safe_remove(target)
+
+    leftovers = list(tmp_path.glob("webui.flocks_old_*"))
+    assert not target.exists()
+    assert len(leftovers) == 1
+    assert (leftovers[0] / "dist" / "index.html").exists()
 
 
 def test_prepare_upgrade_handover_writes_state_and_stops_frontend(

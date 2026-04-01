@@ -111,7 +111,7 @@ async def _run_async(
         cmd,
         cwd=cwd or _get_repo_root(),
         capture_output=True,
-        text=True,
+        text=False,
         timeout=timeout,
     )
     return (
@@ -126,7 +126,7 @@ def _run(cmd: list[str], cwd: Path | None = None) -> tuple[int, str, str]:
         cmd,
         cwd=cwd or _get_repo_root(),
         capture_output=True,
-        text=True,
+        text=False,
     )
     return (
         result.returncode,
@@ -1179,9 +1179,11 @@ def _safe_remove(target: Path) -> None:
             _safe_rmtree(target)
         else:
             target.unlink()
-    except PermissionError:
+    except OSError:
         if sys.platform != "win32":
             raise
+        if not target.exists():
+            return
         renamed = _renamed_lock_path(target)
         target.rename(renamed)
         log.info("updater.rename_locked", {"from": str(target), "to": str(renamed)})
@@ -1662,6 +1664,28 @@ def _build_restart_argv() -> list[str]:
                 "reload_stripped": len(rest) - len(clean_rest),
             })
             return [sys.executable, "-m", module] + clean_rest
+
+    if sys.platform == "win32":
+        argv0_path = Path(argv0)
+        candidates: list[str] = []
+        if argv0:
+            candidates.append(argv0)
+        if argv0_path.suffix == "":
+            candidates.extend([
+                f"{argv0}.exe",
+                f"{argv0}.cmd",
+                f"{argv0}.bat",
+            ])
+        for candidate in candidates:
+            resolved = shutil.which(candidate) or (candidate if Path(candidate).exists() else None)
+            if not resolved:
+                continue
+            suffix = Path(resolved).suffix.lower()
+            if suffix == ".exe":
+                return [resolved] + clean_rest
+            if suffix in {".cmd", ".bat"}:
+                comspec = os.environ.get("COMSPEC") or "cmd.exe"
+                return [comspec, "/c", resolved] + clean_rest
 
     return [sys.executable, argv0] + clean_rest
 
