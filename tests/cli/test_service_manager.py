@@ -288,14 +288,27 @@ def test_start_backend_writes_runtime_metadata(monkeypatch, tmp_path: Path) -> N
 
 def test_build_frontend_env_uses_backend_host_and_port() -> None:
     config = service_manager.ServiceConfig(
+        backend_host="10.0.0.8",
+        backend_port=9000,
+    )
+
+    env = service_manager.build_frontend_env(config)
+
+    assert env["FLOCKS_API_PROXY_TARGET"] == "http://10.0.0.8:9000"
+    assert "VITE_API_BASE_URL" not in env
+    assert "VITE_WS_BASE_URL" not in env
+
+
+def test_build_frontend_env_uses_loopback_for_wildcard_backend_host() -> None:
+    config = service_manager.ServiceConfig(
         backend_host="0.0.0.0",
         backend_port=9000,
     )
 
     env = service_manager.build_frontend_env(config)
 
-    assert env["VITE_API_BASE_URL"] == "http://127.0.0.1:9000"
-    assert env["VITE_WS_BASE_URL"] == "ws://127.0.0.1:9000"
+    assert env["FLOCKS_API_PROXY_TARGET"] == "http://127.0.0.1:9000"
+    assert "VITE_API_BASE_URL" not in env
 
 
 def test_start_frontend_passes_backend_urls_to_build_and_preview(monkeypatch, tmp_path: Path) -> None:
@@ -334,15 +347,16 @@ def test_start_frontend_passes_backend_urls_to_build_and_preview(monkeypatch, tm
     monkeypatch.setattr(service_manager, "_spawn_process", fake_spawn)
 
     config = service_manager.ServiceConfig(
-        backend_host="0.0.0.0",
+        backend_host="10.0.0.8",
         backend_port=9000,
+        frontend_host="0.0.0.0",
         frontend_port=5174,
     )
     service_manager.start_frontend(config, console)
 
     assert build_calls[0]["command"] == ["/usr/bin/npm", "run", "build"]
-    assert build_calls[0]["kwargs"]["env"]["VITE_API_BASE_URL"] == "http://127.0.0.1:9000"
-    assert build_calls[0]["kwargs"]["env"]["VITE_WS_BASE_URL"] == "ws://127.0.0.1:9000"
+    assert build_calls[0]["kwargs"]["env"]["FLOCKS_API_PROXY_TARGET"] == "http://10.0.0.8:9000"
+    assert "VITE_API_BASE_URL" not in build_calls[0]["kwargs"]["env"]
 
     assert preview_calls[0]["command"] == [
         "/usr/bin/npm",
@@ -350,12 +364,12 @@ def test_start_frontend_passes_backend_urls_to_build_and_preview(monkeypatch, tm
         "preview",
         "--",
         "--host",
-        "127.0.0.1",
+        "0.0.0.0",
         "--port",
         "5174",
     ]
-    assert preview_calls[0]["kwargs"]["env"]["VITE_API_BASE_URL"] == "http://127.0.0.1:9000"
-    assert preview_calls[0]["kwargs"]["env"]["VITE_WS_BASE_URL"] == "ws://127.0.0.1:9000"
+    assert preview_calls[0]["kwargs"]["env"]["FLOCKS_API_PROXY_TARGET"] == "http://10.0.0.8:9000"
+    assert "VITE_API_BASE_URL" not in preview_calls[0]["kwargs"]["env"]
 
 
 def test_start_backend_raises_on_port_record_mismatch(monkeypatch, tmp_path: Path) -> None:
@@ -443,7 +457,7 @@ def test_spawn_process_uses_new_session_on_non_windows(monkeypatch, tmp_path: Pa
 def test_spawn_process_passes_custom_environment(monkeypatch, tmp_path: Path) -> None:
     captured = {}
     log_path = tmp_path / "logs" / "backend.log"
-    env = {"VITE_API_BASE_URL": "http://127.0.0.1:9000"}
+    env = {"FLOCKS_API_PROXY_TARGET": "http://127.0.0.1:9000"}
 
     def fake_popen(*args, **kwargs):
         captured["args"] = args

@@ -1,4 +1,4 @@
-﻿$ErrorActionPreference = "Stop"
+$ErrorActionPreference = "Stop"
 
 function Write-Info {
     param([string]$Message)
@@ -107,9 +107,10 @@ $frontendPidFile = Join-Path $logsDir "frontend.pid"
 $backendHost = Get-EnvOrDefault -Name "BACKEND_HOST" -DefaultValue "127.0.0.1"
 $backendAccessHost = Get-AccessHost -Host $backendHost
 $backendPort = [int](Get-EnvOrDefault -Name "BACKEND_PORT" -DefaultValue "8000")
+$frontendHost = Get-EnvOrDefault -Name "FRONTEND_HOST" -DefaultValue "127.0.0.1"
+$frontendAccessHost = Get-AccessHost -Host $frontendHost
 $frontendPort = [int](Get-EnvOrDefault -Name "FRONTEND_PORT" -DefaultValue "5173")
 $backendBaseUrl = "http://{0}:{1}" -f $backendAccessHost, $backendPort
-$backendWsUrl = "ws://{0}:{1}" -f $backendAccessHost, $backendPort
 
 if (-not (Test-Path $pythonExe)) {
     Write-Fail "Python venv not found: $pythonExe"
@@ -132,24 +133,17 @@ Start-Sleep -Seconds 1
 Write-Info "Building WebUI frontend..."
 Push-Location $webuiDir
 try {
-    $originalApiBaseUrl = $env:VITE_API_BASE_URL
-    $originalWsBaseUrl = $env:VITE_WS_BASE_URL
-    $env:VITE_API_BASE_URL = $backendBaseUrl
-    $env:VITE_WS_BASE_URL = $backendWsUrl
+    $originalProxyTarget = $env:FLOCKS_API_PROXY_TARGET
+    $env:FLOCKS_API_PROXY_TARGET = $backendBaseUrl
     & npm.cmd run build
     if ($LASTEXITCODE -ne 0) {
         exit $LASTEXITCODE
     }
 } finally {
-    if ($null -eq $originalApiBaseUrl) {
-        Remove-Item Env:VITE_API_BASE_URL -ErrorAction SilentlyContinue
+    if ($null -eq $originalProxyTarget) {
+        Remove-Item Env:FLOCKS_API_PROXY_TARGET -ErrorAction SilentlyContinue
     } else {
-        $env:VITE_API_BASE_URL = $originalApiBaseUrl
-    }
-    if ($null -eq $originalWsBaseUrl) {
-        Remove-Item Env:VITE_WS_BASE_URL -ErrorAction SilentlyContinue
-    } else {
-        $env:VITE_WS_BASE_URL = $originalWsBaseUrl
+        $env:FLOCKS_API_PROXY_TARGET = $originalProxyTarget
     }
     Pop-Location
 }
@@ -213,7 +207,7 @@ Write-Warn "Backend stdout log: $backendStdout"
 Write-Warn "Backend stderr log: $backendStderr"
 
 Write-Info ("Starting WebUI preview on port {0}..." -f $frontendPort)
-$previewCommand = ('set "VITE_API_BASE_URL={0}" && set "VITE_WS_BASE_URL={1}" && npm.cmd run preview -- --host 127.0.0.1 --port {2}' -f $backendBaseUrl, $backendWsUrl, $frontendPort)
+$previewCommand = ('set "FLOCKS_API_PROXY_TARGET={0}" && npm.cmd run preview -- --host {1} --port {2}' -f $backendBaseUrl, $frontendHost, $frontendPort)
 $frontendArgs = @(
     "/c",
     $previewCommand
@@ -236,7 +230,7 @@ Write-Info "Waiting for frontend startup..."
 for ($attempt = 1; $attempt -le 10; $attempt++) {
     Start-Sleep -Seconds 2
 
-    if (Test-HttpHealth -PythonExe $pythonExe -Urls @("http://127.0.0.1:$frontendPort/")) {
+    if (Test-HttpHealth -PythonExe $pythonExe -Urls @("http://${frontendAccessHost}:$frontendPort/")) {
         $frontendReady = $true
         break
     }
@@ -265,5 +259,5 @@ Write-Warn "Frontend stderr log: $frontendStderr"
 
 Write-Success "Flocks production environment started."
 Write-Warn ("Backend URL: {0}" -f $backendBaseUrl)
-Write-Warn ("Frontend URL: http://127.0.0.1:{0}" -f $frontendPort)
+Write-Warn ("Frontend URL: http://{0}:{1}" -f $frontendAccessHost, $frontendPort)
 Write-Warn ("Stop services: Stop-Process -Id {0},{1} -Force" -f $backendProcess.Id, $frontendProcess.Id)

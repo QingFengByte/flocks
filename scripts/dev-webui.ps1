@@ -1,4 +1,4 @@
-﻿$ErrorActionPreference = "Stop"
+$ErrorActionPreference = "Stop"
 
 function Write-Info {
     param([string]$Message)
@@ -107,9 +107,9 @@ $backendStderr = Join-Path $logsDir "flocks-backend.err.log"
 $backendHost = Get-EnvOrDefault -Name "BACKEND_HOST" -DefaultValue "127.0.0.1"
 $backendAccessHost = Get-AccessHost -Host $backendHost
 $backendPort = [int](Get-EnvOrDefault -Name "BACKEND_PORT" -DefaultValue "8000")
+$frontendHost = Get-EnvOrDefault -Name "FRONTEND_HOST" -DefaultValue "127.0.0.1"
 $frontendPort = [int](Get-EnvOrDefault -Name "FRONTEND_PORT" -DefaultValue "5173")
 $backendBaseUrl = "http://{0}:{1}" -f $backendAccessHost, $backendPort
-$backendWsUrl = "ws://{0}:{1}" -f $backendAccessHost, $backendPort
 
 if (-not (Test-Path $pythonExe)) {
     Write-Fail "Python venv not found: $pythonExe"
@@ -186,21 +186,14 @@ Write-Info ("Starting WebUI frontend on port {0}..." -f $frontendPort)
 
 Push-Location $webuiDir
 try {
-    $originalApiBaseUrl = $env:VITE_API_BASE_URL
-    $originalWsBaseUrl = $env:VITE_WS_BASE_URL
-    $env:VITE_API_BASE_URL = $backendBaseUrl
-    $env:VITE_WS_BASE_URL = $backendWsUrl
-    & npm.cmd run dev -- --host 127.0.0.1 --port $frontendPort
+    $originalProxyTarget = $env:FLOCKS_API_PROXY_TARGET
+    $env:FLOCKS_API_PROXY_TARGET = $backendBaseUrl
+    & npm.cmd run dev -- --host $frontendHost --port $frontendPort
 } finally {
-    if ($null -eq $originalApiBaseUrl) {
-        Remove-Item Env:VITE_API_BASE_URL -ErrorAction SilentlyContinue
+    if ($null -eq $originalProxyTarget) {
+        Remove-Item Env:FLOCKS_API_PROXY_TARGET -ErrorAction SilentlyContinue
     } else {
-        $env:VITE_API_BASE_URL = $originalApiBaseUrl
-    }
-    if ($null -eq $originalWsBaseUrl) {
-        Remove-Item Env:VITE_WS_BASE_URL -ErrorAction SilentlyContinue
-    } else {
-        $env:VITE_WS_BASE_URL = $originalWsBaseUrl
+        $env:FLOCKS_API_PROXY_TARGET = $originalProxyTarget
     }
     Pop-Location
     Write-Warn "Stopping backend service..."

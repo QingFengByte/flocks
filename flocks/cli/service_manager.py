@@ -39,7 +39,7 @@ class ServiceConfig:
 
     @property
     def backend_urls(self) -> list[str]:
-        base = f"http://{_loopback_host(self.backend_host)}:{self.backend_port}"
+        base = backend_access_base_url(self)
         return [f"{base}{path}" for path in BACKEND_HEALTH_PATHS]
 
     @property
@@ -791,15 +791,20 @@ def open_default_browser(url: str, console) -> None:
     console.print(f"[flocks] 未检测到可用的浏览器打开命令，请手动访问: {url}")
 
 
-def build_frontend_env(config: ServiceConfig) -> dict[str, str]:
-    """Build frontend environment variables from backend service settings."""
-    backend_host = _loopback_host(config.backend_host)
-    api_base_url = f"http://{backend_host}:{config.backend_port}"
-    ws_protocol = "wss" if api_base_url.startswith("https://") else "ws"
+def access_host(host: str) -> str:
+    """Return the host that local health checks and browser requests should use."""
+    return _loopback_host(host)
 
+
+def backend_access_base_url(config: ServiceConfig) -> str:
+    """Return the backend base URL that the local WebUI should connect to."""
+    return f"http://{access_host(config.backend_host)}:{config.backend_port}"
+
+
+def build_frontend_env(config: ServiceConfig) -> dict[str, str]:
+    """Build frontend proxy environment variables from backend service settings."""
     env = os.environ.copy()
-    env["VITE_API_BASE_URL"] = api_base_url
-    env["VITE_WS_BASE_URL"] = f"{ws_protocol}://{backend_host}:{config.backend_port}"
+    env["FLOCKS_API_PROXY_TARGET"] = backend_access_base_url(config)
     return env
 
 

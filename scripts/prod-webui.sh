@@ -12,13 +12,17 @@ RED='\033[0;31m'
 NC='\033[0m'
 BACKEND_HOST="${BACKEND_HOST:-127.0.0.1}"
 BACKEND_PORT="${BACKEND_PORT:-8000}"
+FRONTEND_HOST="${FRONTEND_HOST:-127.0.0.1}"
 FRONTEND_PORT="${FRONTEND_PORT:-5173}"
 BACKEND_ACCESS_HOST="${BACKEND_HOST}"
 if [ "${BACKEND_ACCESS_HOST}" = "0.0.0.0" ] || [ "${BACKEND_ACCESS_HOST}" = "::" ]; then
     BACKEND_ACCESS_HOST="127.0.0.1"
 fi
 BACKEND_BASE_URL="http://${BACKEND_ACCESS_HOST}:${BACKEND_PORT}"
-BACKEND_WS_URL="ws://${BACKEND_ACCESS_HOST}:${BACKEND_PORT}"
+FRONTEND_ACCESS_HOST="${FRONTEND_HOST}"
+if [ "${FRONTEND_ACCESS_HOST}" = "0.0.0.0" ] || [ "${FRONTEND_ACCESS_HOST}" = "::" ]; then
+    FRONTEND_ACCESS_HOST="127.0.0.1"
+fi
 BACKEND_HEALTH_URL="${BACKEND_HEALTH_URL:-${BACKEND_BASE_URL}/api/health}"
 BACKEND_STARTUP_TIMEOUT="${BACKEND_STARTUP_TIMEOUT:-90}"
 BACKEND_HEALTH_CHECK_INTERVAL="${BACKEND_HEALTH_CHECK_INTERVAL:-2}"
@@ -39,8 +43,7 @@ mkdir -p "$LOGS_DIR"
 
 echo -e "${BLUE}📦 构建 WebUI 前端...${NC}"
 cd webui
-VITE_API_BASE_URL="${BACKEND_BASE_URL}" \
-VITE_WS_BASE_URL="${BACKEND_WS_URL}" \
+FLOCKS_API_PROXY_TARGET="${BACKEND_BASE_URL}" \
 npm run build
 cd "$PROJECT_ROOT"
 
@@ -86,9 +89,8 @@ done
 echo -e "${GREEN}🎨 启动 WebUI 前端（端口 ${FRONTEND_PORT}）...${NC}"
 cd webui
 nohup env \
-    VITE_API_BASE_URL="${BACKEND_BASE_URL}" \
-    VITE_WS_BASE_URL="${BACKEND_WS_URL}" \
-    npm run preview -- --host 127.0.0.1 --port "${FRONTEND_PORT}" \
+    FLOCKS_API_PROXY_TARGET="${BACKEND_BASE_URL}" \
+    npm run preview -- --host "${FRONTEND_HOST}" --port "${FRONTEND_PORT}" \
     > "${LOGS_DIR}/webui-preview.log" 2>&1 &
 FRONTEND_PID=$!
 
@@ -103,6 +105,7 @@ fi
 echo -e "${GREEN}✓ Flocks 生产环境启动完成${NC}"
 echo -e "${YELLOW}  后端 PID: ${BACKEND_PID}  日志: tail -f /tmp/flocks-backend.log${NC}"
 echo -e "${YELLOW}  前端 PID: ${FRONTEND_PID}  日志: tail -f ${LOGS_DIR}/webui-preview.log${NC}"
+echo -e "${YELLOW}  访问前端: http://${FRONTEND_ACCESS_HOST}:${FRONTEND_PORT}${NC}"
 echo -e "${YELLOW}  停止服务: kill ${BACKEND_PID} ${FRONTEND_PID}${NC}"
 
 echo "$BACKEND_PID" > "${LOGS_DIR}/backend.pid"
