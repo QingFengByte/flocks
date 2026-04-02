@@ -61,7 +61,7 @@ curl -fsSL https://raw.githubusercontent.com/AgentFlocks/flocks/main/install.sh 
 curl -fsSL https://raw.githubusercontent.com/AgentFlocks/flocks/main/install.sh | bash -s -- --with-tui
 ```
 
-#### Windows PowerShell
+#### Windows PowerShell (Administrator)
 
 ```powershell
 # One-click install backend + WebUI
@@ -89,7 +89,7 @@ Macos/Linux
 ./scripts/install.sh # Macos/Linux
 ```
 
-Windows powershell (Admin)
+Windows powershell (Administrator)
 ```bash
 powershell -ep Bypass -File .\scripts\install.ps1 # Windows powershell
 ```
@@ -110,8 +110,9 @@ flocks stop
 ```
 
 The default service URLs are:
-- Backend API: `http://127.0.0.1:8000` by default, configurable via `flocks start --server-port`
-- WebUI: `http://127.0.0.1:5173` by default, configurable via `flocks start --webui-port`
+- Backend API: `http://127.0.0.1:8000` by default
+- WebUI: `http://127.0.0.1:5173` by default
+- Remote access configurable via `flocks start --server-host <ip> --webui-host <ip>`
 
 Flocks cli useage:  `flocks --help`
 

@@ -803,7 +803,7 @@ function Configure-AgentBrowserBrowser {
 function Install-AgentBrowser {
     if (-not (Test-Command "agent-browser")) {
         Write-Info "安装 agent-browser CLI..."
-        Invoke-NativeCommandOrFail `
+        $null = Invoke-NativeCommandOrFail `
             -Description "agent-browser CLI 安装" `
             -FilePath "npm.cmd" `
             -ArgumentList @("install", "--global", "agent-browser")
@@ -838,7 +838,7 @@ function Install-DingtalkChannelDeps {
 
     Push-Location $connectorDir
     try {
-        Invoke-NativeCommandOrFail `
+        $null = Invoke-NativeCommandOrFail `
             -Description "钉钉 channel npm 依赖安装" `
             -FilePath "npm.cmd" `
             -ArgumentList @("install") `
@@ -892,7 +892,7 @@ function Main {
     Write-Info "安装 WebUI 依赖..."
     Push-Location (Join-Path $RootDir "webui")
     try {
-        Invoke-NativeCommandOrFail `
+        $null = Invoke-NativeCommandOrFail `
             -Description "WebUI 依赖安装" `
             -FilePath "npm.cmd" `
             -ArgumentList @("install") `
@@ -909,7 +909,7 @@ function Main {
         Write-Info "安装 TUI 依赖..."
         Push-Location (Join-Path $RootDir "tui")
         try {
-            Invoke-NativeCommandOrFail `
+            $null = Invoke-NativeCommandOrFail `
                 -Description "TUI 依赖安装" `
                 -FilePath "bun" `
                 -ArgumentList @("install") `

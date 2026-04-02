@@ -41,6 +41,8 @@ def test_powershell_installer_stops_processes_before_retrying_locked_operations(
     assert "-RedirectStandardOutput $stdoutPath" in script
     assert "-RedirectStandardError $stderrPath" in script
     assert "Invoke-InstallerCommandWithLockRetry" in script
+    assert "$result = Invoke-NativeCommandOrFail" in script
+    assert "$null = Invoke-NativeCommandOrFail" in script
     assert '-Description "Python 后端依赖安装"' in script
     assert '-Description "flocks 全局 CLI 安装"' in script
     assert "Failed to update Windows PE resources" in script
