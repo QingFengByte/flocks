@@ -25,7 +25,7 @@ import tempfile
 import time
 import zipfile
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any, AsyncGenerator
 from urllib.parse import quote
 
@@ -68,6 +68,42 @@ def _clean_process_output(value: str | bytes | None) -> str:
     if isinstance(value, bytes):
         return value.decode(errors="replace").strip()
     return value.strip()
+
+
+def _windows_path_suffix(value: str) -> str:
+    """Return a Windows-style suffix even when running tests on non-Windows hosts."""
+    return PureWindowsPath(value).suffix.lower()
+
+
+def _windows_path_name(value: str) -> str:
+    """Return a Windows-style basename even when running tests on non-Windows hosts."""
+    return PureWindowsPath(value).name
+
+
+def _windows_path_stem(value: str) -> str:
+    """Return a Windows-style stem even when running tests on non-Windows hosts."""
+    return PureWindowsPath(value).stem.lower()
+
+
+def _windows_command_candidates(name: str) -> list[str]:
+    """Return Windows launcher candidates for *name* preserving explicit suffixes."""
+    if _windows_path_suffix(name) in {".exe", ".cmd", ".bat"}:
+        return [name]
+    return [name, f"{name}.exe", f"{name}.cmd", f"{name}.bat"]
+
+
+def _windows_paths_match(left: str, right: str) -> bool:
+    """Return True when two Windows paths likely point to the same launcher/script."""
+    if not left or not right:
+        return False
+    left_path = PureWindowsPath(left)
+    right_path = PureWindowsPath(right)
+    return left_path == right_path or left_path.name == right_path.name
+
+
+def _looks_like_windows_python_launcher(entry: str) -> bool:
+    """Return True when *entry* looks like a Windows Python launcher."""
+    return _windows_path_stem(entry) in {"python", "pythonw", "py"}
 
 
 def _get_repo_root() -> Path:
@@ -1189,14 +1225,6 @@ def _safe_remove(target: Path) -> None:
         log.info("updater.rename_locked", {"from": str(target), "to": str(renamed)})
 
 
-def _has_preserved_children(directory: Path) -> bool:
-    """Check if *directory* directly contains any ``_PRESERVE_NAMES`` entries."""
-    try:
-        return any(child.name in _PRESERVE_NAMES for child in directory.iterdir())
-    except OSError:
-        return False
-
-
 def _replace_install_dir(
     source_dir: Path,
     install_root: Path,
@@ -1206,26 +1234,28 @@ def _replace_install_dir(
     preserving user/runtime directories listed in ``_PRESERVE_NAMES``
     at **any** directory depth (not only the top level).
     """
+    install_root.mkdir(parents=True, exist_ok=True)
+    source_names = {item.name for item in source_dir.iterdir()}
+
     for item in source_dir.iterdir():
         if item.name in _PRESERVE_NAMES:
             continue
         target = install_root / item.name
-        if target.exists() or target.is_symlink():
-            if target.is_dir() and not target.is_symlink():
-                if item.is_dir() and _has_preserved_children(target):
+        if item.is_dir() and not item.is_symlink():
+            if target.exists() or target.is_symlink():
+                if target.is_dir() and not target.is_symlink():
                     _replace_install_dir(item, target)
-                    source_names = {c.name for c in item.iterdir()}
-                    for child in target.iterdir():
-                        if child.name not in source_names and child.name not in _PRESERVE_NAMES:
-                            _safe_remove(child)
                     continue
                 _safe_remove(target)
-            else:
-                _safe_remove(target)
-        if item.is_dir():
             shutil.copytree(item, target, symlinks=True)
         else:
+            if target.exists() or target.is_symlink():
+                _safe_remove(target)
             shutil.copy2(item, target)
+
+    for child in install_root.iterdir():
+        if child.name not in source_names and child.name not in _PRESERVE_NAMES:
+            _safe_remove(child)
 
 
 # ------------------------------------------------------------------ #
@@ -1259,7 +1289,7 @@ def get_current_version() -> str:
             ["git", "describe", "--tags", "--abbrev=0"],
             cwd=_get_repo_root(),
             capture_output=True,
-            text=True,
+            text=False,
             timeout=3,
         )
         stdout = _clean_process_output(result.stdout)
@@ -1577,8 +1607,10 @@ async def perform_update(
 
     uv_path = _find_executable("uv")
     if uv_path:
+        log.info("updater.dependencies.sync", {"tool": "uv", "path": uv_path})
         code, _, err = await _run_async([uv_path, "sync"], cwd=install_root, timeout=120)
     else:
+        log.warning("updater.dependencies.sync_fallback", {"tool": "pip"})
         code, _, err = await _run_async(
             [sys.executable, "-m", "pip", "install", "-e", ".", "--quiet"],
             cwd=install_root,
@@ -1649,6 +1681,18 @@ def _build_restart_argv() -> list[str]:
             continue
         clean_rest.append(arg)
 
+    if sys.platform == "win32":
+        resolved = _resolve_windows_restart_command(
+            argv0,
+            getattr(sys, "orig_argv", []),
+        )
+        if resolved:
+            return resolved + clean_rest
+
+        resolved = _resolve_windows_launcher_entry(argv0)
+        if resolved:
+            return resolved + clean_rest
+
     if argv0.endswith("__main__.py"):
         pkg_dir = Path(argv0).parent
         parts: list[str] = []
@@ -1665,29 +1709,66 @@ def _build_restart_argv() -> list[str]:
             })
             return [sys.executable, "-m", module] + clean_rest
 
-    if sys.platform == "win32":
-        argv0_path = Path(argv0)
-        candidates: list[str] = []
-        if argv0:
-            candidates.append(argv0)
-        if argv0_path.suffix == "":
-            candidates.extend([
-                f"{argv0}.exe",
-                f"{argv0}.cmd",
-                f"{argv0}.bat",
-            ])
-        for candidate in candidates:
-            resolved = shutil.which(candidate) or (candidate if Path(candidate).exists() else None)
-            if not resolved:
-                continue
-            suffix = Path(resolved).suffix.lower()
-            if suffix == ".exe":
-                return [resolved] + clean_rest
-            if suffix in {".cmd", ".bat"}:
-                comspec = os.environ.get("COMSPEC") or "cmd.exe"
-                return [comspec, "/c", resolved] + clean_rest
-
     return [sys.executable, argv0] + clean_rest
+
+
+def _resolve_windows_restart_command(argv0: str, orig_argv: list[str]) -> list[str] | None:
+    """Recover the Windows launcher plus script or ``-m`` invocation from ``orig_argv``."""
+    if not orig_argv:
+        return None
+
+    launcher = _resolve_windows_launcher_entry(orig_argv[0])
+    if not launcher:
+        return None
+
+    tail = orig_argv[1:]
+    if not tail:
+        return launcher
+
+    if not _looks_like_windows_python_launcher(orig_argv[0]):
+        return launcher
+
+    for index, value in enumerate(tail):
+        if _windows_paths_match(value, argv0):
+            return launcher + tail[:index + 1]
+
+    for index, value in enumerate(tail[:-1]):
+        if value == "-m":
+            return launcher + tail[:index + 2]
+
+    return None
+
+
+def _resolve_windows_launcher_entry(entry: str) -> list[str] | None:
+    """Resolve a single Windows launcher executable or cmd shim."""
+    if not entry:
+        return None
+
+    candidates = _windows_command_candidates(entry)
+    entry_name = _windows_path_name(entry)
+    if entry_name and entry_name != entry:
+        candidates.extend(_windows_command_candidates(entry_name))
+
+    seen: set[str] = set()
+    for candidate in candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+
+        resolved = shutil.which(candidate)
+        if not resolved and Path(candidate).exists():
+            resolved = candidate
+        if not resolved:
+            continue
+
+        suffix = _windows_path_suffix(resolved)
+        if suffix == ".exe":
+            return [resolved]
+        if suffix in {".cmd", ".bat"}:
+            comspec = os.environ.get("COMSPEC") or "cmd.exe"
+            return [comspec, "/c", resolved]
+
+    return None
 
 
 def _find_executable(name: str) -> str | None:
@@ -1695,10 +1776,14 @@ def _find_executable(name: str) -> str | None:
     if found and not found.startswith("/mnt/"):
         return found
     repo_root = _get_repo_root()
-    venv_candidates = [
-        repo_root / ".venv" / "bin" / name,
-        repo_root / ".venv" / "Scripts" / name,
-    ]
+    venv_candidates = [repo_root / ".venv" / "bin" / name]
+    if sys.platform == "win32":
+        venv_candidates.extend(
+            repo_root / ".venv" / "Scripts" / candidate
+            for candidate in _windows_command_candidates(name)
+        )
+    else:
+        venv_candidates.append(repo_root / ".venv" / "Scripts" / name)
     for candidate in venv_candidates:
         if candidate.exists():
             return str(candidate)

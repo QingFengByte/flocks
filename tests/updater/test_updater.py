@@ -24,6 +24,47 @@ def test_run_handles_none_process_output(monkeypatch: pytest.MonkeyPatch, tmp_pa
     assert stderr == ""
 
 
+def test_run_replaces_invalid_windows_stderr_bytes(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    def fake_run(*args, **kwargs):
+        return subprocess.CompletedProcess(
+            args=args[0],
+            returncode=1,
+            stdout=b"",
+            stderr=b"failed\x93output",
+        )
+
+    monkeypatch.setattr(updater.subprocess, "run", fake_run)
+
+    code, stdout, stderr = updater._run(["npm", "run", "build"], cwd=tmp_path)
+
+    assert code == 1
+    assert stdout == ""
+    assert stderr == "failed�output"
+
+
+def test_get_current_version_replaces_invalid_git_bytes(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(updater, "_VERSION_MARKER_PATH", tmp_path / ".current_version")
+    monkeypatch.setattr(updater, "_get_repo_root", lambda: tmp_path)
+
+    def fake_run(*args, **kwargs):
+        return subprocess.CompletedProcess(
+            args=args[0],
+            returncode=0,
+            stdout=b"v2026.4.1\x93\n",
+            stderr=b"",
+        )
+
+    monkeypatch.setattr(updater.subprocess, "run", fake_run)
+
+    assert updater.get_current_version() == "2026.4.1�"
+
+
 @pytest.mark.asyncio
 async def test_run_async_handles_none_process_output(
     monkeypatch: pytest.MonkeyPatch,
@@ -69,13 +110,30 @@ def test_find_executable_checks_windows_scripts_dir(
 ) -> None:
     scripts_dir = tmp_path / ".venv" / "Scripts"
     scripts_dir.mkdir(parents=True)
-    uv_cmd = scripts_dir / "uv.cmd"
-    uv_cmd.write_text("", encoding="utf-8")
+    uv_exe = scripts_dir / "uv.exe"
+    uv_exe.write_text("", encoding="utf-8")
 
     monkeypatch.setattr(shutil, "which", lambda name: None)
     monkeypatch.setattr(updater, "_get_repo_root", lambda: tmp_path)
+    monkeypatch.setattr(updater.sys, "platform", "win32")
 
-    assert updater._find_executable("uv.cmd") == str(uv_cmd)
+    assert updater._find_executable("uv") == str(uv_exe)
+
+
+def test_find_executable_checks_windows_cmd_suffixes(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    scripts_dir = tmp_path / ".venv" / "Scripts"
+    scripts_dir.mkdir(parents=True)
+    npm_cmd = scripts_dir / "npm.cmd"
+    npm_cmd.write_text("", encoding="utf-8")
+
+    monkeypatch.setattr(shutil, "which", lambda name: None)
+    monkeypatch.setattr(updater, "_get_repo_root", lambda: tmp_path)
+    monkeypatch.setattr(updater.sys, "platform", "win32")
+
+    assert updater._find_executable("npm") == str(npm_cmd)
 
 
 def test_find_executable_ignores_wsl_mnt_paths(
@@ -132,6 +190,116 @@ def test_build_restart_argv_uses_windows_executable_shim(
         "start",
         "--port",
         "8000",
+    ]
+
+
+def test_build_restart_argv_preserves_python_script_path_from_orig_argv(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(updater.sys, "platform", "win32")
+    monkeypatch.setattr(updater.sys, "executable", r"C:\Python312\python.exe")
+    monkeypatch.setattr(
+        updater.sys,
+        "argv",
+        [r"C:\Users\worker\.local\bin\flocks", "start"],
+    )
+    monkeypatch.setattr(
+        updater.sys,
+        "orig_argv",
+        [r"C:\Python312\python.exe", r"C:\Users\worker\.local\bin\flocks", "start"],
+    )
+    monkeypatch.setattr(
+        updater.shutil,
+        "which",
+        lambda name: r"C:\Python312\python.exe" if name == r"C:\Python312\python.exe" else None,
+    )
+
+    assert updater._build_restart_argv() == [
+        r"C:\Python312\python.exe",
+        r"C:\Users\worker\.local\bin\flocks",
+        "start",
+    ]
+
+
+def test_build_restart_argv_prefers_windows_orig_argv_launcher(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(updater.sys, "platform", "win32")
+    monkeypatch.setattr(updater.sys, "executable", r"C:\Python312\python.exe")
+    monkeypatch.setattr(
+        updater.sys,
+        "argv",
+        [r"C:\Users\worker\.local\bin\flocks", "start"],
+    )
+    monkeypatch.setattr(
+        updater.sys,
+        "orig_argv",
+        [r"C:\Users\worker\AppData\Roaming\uv\bin\flocks.exe", "start"],
+    )
+    monkeypatch.setattr(
+        updater.shutil,
+        "which",
+        lambda name: r"C:\Users\worker\AppData\Roaming\uv\bin\flocks.exe" if name == r"C:\Users\worker\AppData\Roaming\uv\bin\flocks.exe" else None,
+    )
+
+    assert updater._build_restart_argv() == [
+        r"C:\Users\worker\AppData\Roaming\uv\bin\flocks.exe",
+        "start",
+    ]
+
+
+def test_build_restart_argv_preserves_windows_module_invocation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(updater.sys, "platform", "win32")
+    monkeypatch.setattr(updater.sys, "executable", r"C:\Python312\python.exe")
+    monkeypatch.setattr(
+        updater.sys,
+        "argv",
+        [r"C:\repo\flocks\__main__.py", "start", "--reload"],
+    )
+    monkeypatch.setattr(
+        updater.sys,
+        "orig_argv",
+        [r"C:\Windows\py.exe", "-m", "flocks", "start", "--reload"],
+    )
+    monkeypatch.setattr(
+        updater.shutil,
+        "which",
+        lambda name: r"C:\Windows\py.exe" if name == r"C:\Windows\py.exe" else None,
+    )
+
+    assert updater._build_restart_argv() == [
+        r"C:\Windows\py.exe",
+        "-m",
+        "flocks",
+        "start",
+    ]
+
+
+def test_build_restart_argv_falls_back_to_path_launcher_name_when_orig_argv_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(updater.sys, "platform", "win32")
+    monkeypatch.setattr(updater.sys, "executable", r"C:\Python312\python.exe")
+    monkeypatch.setattr(
+        updater.sys,
+        "argv",
+        [r"C:\Users\worker\.local\bin\flocks", "start"],
+    )
+    monkeypatch.delattr(updater.sys, "orig_argv", raising=False)
+    monkeypatch.setattr(
+        updater.shutil,
+        "which",
+        lambda name: r"C:\Users\worker\AppData\Roaming\uv\bin\flocks.exe" if name in {
+            "flocks.exe",
+            "flocks",
+        } else None,
+    )
+
+    assert updater._build_restart_argv() == [
+        r"C:\Users\worker\AppData\Roaming\uv\bin\flocks.exe",
+        "start",
     ]
 
 
@@ -633,6 +801,30 @@ def test_cleanup_old_backups_keeps_latest_only(monkeypatch: pytest.MonkeyPatch, 
     assert not oldest.exists()
 
 
+def test_replace_install_dir_preserves_webui_node_modules(
+    tmp_path: Path,
+) -> None:
+    source_dir = tmp_path / "source"
+    install_root = tmp_path / "install"
+    source_webui = source_dir / "webui"
+    target_webui = install_root / "webui"
+
+    (source_webui / "dist").mkdir(parents=True)
+    (source_webui / "dist" / "index.html").write_text("new", encoding="utf-8")
+    (source_webui / "package.json").write_text('{"name":"webui"}', encoding="utf-8")
+
+    (target_webui / "dist").mkdir(parents=True)
+    (target_webui / "dist" / "index.html").write_text("old", encoding="utf-8")
+    locked_binary = target_webui / "node_modules" / "@esbuild" / "win32-x64" / "esbuild.exe"
+    locked_binary.parent.mkdir(parents=True)
+    locked_binary.write_text("locked", encoding="utf-8")
+
+    updater._replace_install_dir(source_dir, install_root)
+
+    assert (target_webui / "dist" / "index.html").read_text(encoding="utf-8") == "new"
+    assert locked_binary.read_text(encoding="utf-8") == "locked"
+
+
 @pytest.mark.asyncio
 async def test_perform_update_builds_staged_frontend_before_handover(
     monkeypatch: pytest.MonkeyPatch,
@@ -707,6 +899,77 @@ async def test_perform_update_builds_staged_frontend_before_handover(
     assert [step.stage for step in progresses][-1] == "error"
     assert events[:5] == ["npm-install", "npm-build", "handover", "replace", "uv-sync"]
     assert "marker:2026.4.1" in events
+
+
+@pytest.mark.asyncio
+async def test_perform_update_rolls_back_when_replace_fails_on_windows_locked_file(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    archive_path = tmp_path / "flocks.zip"
+    archive_path.write_text("archive", encoding="utf-8")
+    staged_root = tmp_path / "staged"
+    staged_webui = staged_root / "webui"
+    staged_webui.mkdir(parents=True)
+    (staged_webui / "package.json").write_text("{}", encoding="utf-8")
+    (staged_webui / "dist").mkdir()
+    (staged_webui / "dist" / "index.html").write_text("<html></html>", encoding="utf-8")
+
+    events: list[str] = []
+
+    async def fake_get_updater_config():
+        return SimpleNamespace(
+            archive_format="zip",
+            sources=["github"],
+            repo="AgentFlocks/Flocks",
+            token=None,
+            gitee_token=None,
+            backup_retain_count=3,
+            base_url=None,
+            gitee_repo=None,
+        )
+
+    async def fake_download_with_fallback(**_kwargs):
+        return archive_path
+
+    async def fake_run_async(cmd, cwd=None, timeout=None):
+        if cmd[1] == "install":
+            events.append("npm-install")
+        elif cmd[:3] == ["/usr/bin/npm", "run", "build"]:
+            events.append("npm-build")
+        else:
+            events.append("unexpected")
+        return 0, "", ""
+
+    monkeypatch.setattr(updater, "_get_updater_config", fake_get_updater_config)
+    monkeypatch.setattr(updater, "_get_repo_root", lambda: tmp_path / "install-root")
+    monkeypatch.setattr(updater, "get_current_version", lambda: "2026.3.31")
+    monkeypatch.setattr(updater, "_download_with_fallback", fake_download_with_fallback)
+    monkeypatch.setattr(updater, "_backup_current_version", lambda *_args, **_kwargs: tmp_path / "backup.tar.gz")
+    monkeypatch.setattr(updater, "_extract_archive", lambda *_args, **_kwargs: staged_root)
+    monkeypatch.setattr(updater, "_run_async", fake_run_async)
+    monkeypatch.setattr(
+        updater,
+        "_find_executable",
+        lambda name: "/usr/bin/npm" if name in {"npm", "npm.cmd"} else "/usr/bin/uv",
+    )
+    monkeypatch.setattr(updater, "_prepare_upgrade_handover", lambda _version: events.append("handover") or {})
+    monkeypatch.setattr(
+        updater,
+        "_replace_install_dir",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            PermissionError(
+                "[WinError 5] Access is denied: 'C:\\Users\\worker\\Desktop\\flocks-main\\webui\\node_modules\\@esbuild\\win32-x64\\esbuild.exe'"
+            )
+        ),
+    )
+    monkeypatch.setattr(updater, "_rollback_failed_update", lambda *_args: events.append("rollback"))
+
+    progresses = [step async for step in updater.perform_update("2026.4.1")]
+
+    assert progresses[-1].stage == "error"
+    assert "WinError 5" in progresses[-1].message
+    assert events == ["npm-install", "npm-build", "handover", "rollback"]
 
 
 @pytest.mark.asyncio
