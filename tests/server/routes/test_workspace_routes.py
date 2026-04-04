@@ -279,10 +279,10 @@ class TestWorkspaceUpload:
         assert not (mock_workspace / "archive.zip").exists()
 
     @pytest.mark.asyncio
-    async def test_upload_renames_duplicate_file(
+    async def test_upload_overwrites_duplicate_file_without_chat_purpose(
         self, client: AsyncClient, mock_workspace: Path
     ):
-        """Uploading the same filename twice should preserve the original file."""
+        """Generic workspace uploads overwrite duplicate filenames by default."""
         first = await client.post(
             "/api/workspace/upload",
             params={"dest": "uploads"},
@@ -291,6 +291,31 @@ class TestWorkspaceUpload:
         second = await client.post(
             "/api/workspace/upload",
             params={"dest": "uploads"},
+            files={"files": ("report.pdf", io.BytesIO(b"second"), "application/pdf")},
+        )
+        assert first.status_code == status.HTTP_200_OK
+        assert second.status_code == status.HTTP_200_OK
+        first_item = first.json()["uploaded"][0]
+        second_item = second.json()["uploaded"][0]
+        assert first_item["name"] == "report.pdf"
+        assert second_item["name"] == "report.pdf"
+        assert first_item["path"] == "uploads/report.pdf"
+        assert second_item["path"] == "uploads/report.pdf"
+        assert (mock_workspace / "uploads" / "report.pdf").read_bytes() == b"second"
+
+    @pytest.mark.asyncio
+    async def test_chat_upload_renames_duplicate_file(
+        self, client: AsyncClient, mock_workspace: Path
+    ):
+        """Chat uploads auto-rename duplicates to preserve attachment paths."""
+        first = await client.post(
+            "/api/workspace/upload",
+            params={"dest": "uploads", "purpose": "chat"},
+            files={"files": ("report.pdf", io.BytesIO(b"first"), "application/pdf")},
+        )
+        second = await client.post(
+            "/api/workspace/upload",
+            params={"dest": "uploads", "purpose": "chat"},
             files={"files": ("report.pdf", io.BytesIO(b"second"), "application/pdf")},
         )
         assert first.status_code == status.HTTP_200_OK

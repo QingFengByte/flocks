@@ -28,6 +28,7 @@ from flocks.workspace.manager import WorkspaceManager
 
 SUPPORTED_SUFFIXES = {".pdf", ".docx", ".doc"}
 WORD_NAMESPACE = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+DOCX_SOFT_BREAK_TOKEN = "<<FLOCKS_DOCX_SOFT_BREAK>>"
 
 
 def _normalize_markdown(text: str) -> str:
@@ -46,7 +47,7 @@ def _normalize_markdown(text: str) -> str:
 
     result = "".join(normalized_parts).strip()
     result = re.sub(r"\n{3,}", "\n\n", result)
-    return result
+    return result.replace(DOCX_SOFT_BREAK_TOKEN, "\n")
 
 
 def _normalize_text_segment(text: str) -> str:
@@ -103,9 +104,12 @@ def _default_output_path(input_file: Path) -> Path:
 
 def _resolve_input_path(input_path: str) -> Path:
     path = Path(input_path).expanduser()
-    if not path.is_absolute():
-        path = (Path.cwd() / path).resolve()
-    return path
+    if path.is_absolute():
+        return path.resolve()
+
+    workspace = WorkspaceManager.get_instance()
+    workspace.ensure_dirs()
+    return workspace.resolve_workspace_path(str(path))
 
 
 def _resolve_output_path(input_file: Path, output_path: str | None) -> Path:
@@ -197,19 +201,27 @@ def _format_docx_text(text: str, style_name: str) -> str:
 
 
 def _run_text(run: ET.Element) -> str:
-    text_parts = [node.text or "" for node in run.findall(".//w:t", WORD_NAMESPACE)]
+    properties = run.find("w:rPr", WORD_NAMESPACE)
+    text_parts: list[str] = []
+    for node in run.iter():
+        if node is run:
+            continue
+        if node.tag == _word_tag("t"):
+            text = node.text or ""
+            if properties is not None and text:
+                if properties.find("w:b", WORD_NAMESPACE) is not None:
+                    text = f"**{text}**"
+                if properties.find("w:i", WORD_NAMESPACE) is not None:
+                    text = f"*{text}*"
+                if properties.find("w:u", WORD_NAMESPACE) is not None:
+                    text = f"__{text}__"
+            text_parts.append(text)
+        elif node.tag == _word_tag("br"):
+            text_parts.append(DOCX_SOFT_BREAK_TOKEN)
+
     text = "".join(text_parts)
     if not text:
         return ""
-
-    properties = run.find("w:rPr", WORD_NAMESPACE)
-    if properties is not None:
-        if properties.find("w:b", WORD_NAMESPACE) is not None:
-            text = f"**{text}**"
-        if properties.find("w:i", WORD_NAMESPACE) is not None:
-            text = f"*{text}*"
-        if properties.find("w:u", WORD_NAMESPACE) is not None:
-            text = f"__{text}__"
     return text
 
 
@@ -244,7 +256,13 @@ def _table_to_markdown(table: ET.Element, styles: dict[str, str]) -> str:
                 paragraph_text = _paragraph_text(paragraph, styles)
                 if paragraph_text:
                     cell_parts.append(paragraph_text)
-            cell_text = " ".join(cell_parts).strip().replace("\n", " ").replace("|", r"\|")
+            cell_text = (
+                " ".join(cell_parts)
+                .strip()
+                .replace(DOCX_SOFT_BREAK_TOKEN, " ")
+                .replace("\n", " ")
+                .replace("|", r"\|")
+            )
             cells.append(cell_text)
         if not cells:
             continue

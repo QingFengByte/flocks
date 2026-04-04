@@ -278,7 +278,7 @@ class TestUpload:
         assert r.status_code == 200
         assert (_ws(workspace_client) / "new_folder" / "x.txt").exists()
 
-    def test_upload_renames_duplicate_file(self, workspace_client):
+    def test_upload_overwrites_duplicate_file_without_chat_purpose(self, workspace_client):
         client = _client(workspace_client)
         first = client.post(
             "/api/workspace/upload?dest=uploads",
@@ -286,6 +286,26 @@ class TestUpload:
         )
         second = client.post(
             "/api/workspace/upload?dest=uploads",
+            files=[("files", ("report.pdf", b"second", "application/pdf"))],
+        )
+        assert first.status_code == 200
+        assert second.status_code == 200
+        first_item = first.json()["uploaded"][0]
+        second_item = second.json()["uploaded"][0]
+        assert first_item["name"] == "report.pdf"
+        assert second_item["name"] == "report.pdf"
+        assert first_item["path"] == "uploads/report.pdf"
+        assert second_item["path"] == "uploads/report.pdf"
+        assert (_ws(workspace_client) / "uploads" / "report.pdf").read_bytes() == b"second"
+
+    def test_chat_upload_renames_duplicate_file(self, workspace_client):
+        client = _client(workspace_client)
+        first = client.post(
+            "/api/workspace/upload?dest=uploads&purpose=chat",
+            files=[("files", ("report.pdf", b"first", "application/pdf"))],
+        )
+        second = client.post(
+            "/api/workspace/upload?dest=uploads&purpose=chat",
             files=[("files", ("report.pdf", b"second", "application/pdf"))],
         )
         assert first.status_code == 200

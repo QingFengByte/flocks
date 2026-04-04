@@ -14,7 +14,7 @@ def _load_module():
     return module
 
 
-def _write_minimal_docx(path: Path) -> None:
+def _write_minimal_docx(path: Path, document_xml: str | None = None) -> None:
     content_types = textwrap.dedent("""\
         <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
         <Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
@@ -41,7 +41,7 @@ def _write_minimal_docx(path: Path) -> None:
           </w:style>
         </w:styles>
     """)
-    document = textwrap.dedent("""\
+    document = document_xml or textwrap.dedent("""\
         <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
         <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
           <w:body>
@@ -82,6 +82,25 @@ def test_default_output_path_uses_workspace_outputs(tmp_path, monkeypatch, doc_p
     expected_dir = tmp_path / "workspace" / "outputs" / dt.date.today().isoformat()
     assert output_path.parent == expected_dir
     assert output_path.name == "Final_docx.md"
+
+
+def test_resolve_input_path_uses_workspace_dir_for_relative_paths(tmp_path, monkeypatch, doc_parser_module):
+    previous_instance = WorkspaceManager._instance
+    WorkspaceManager._instance = None
+    workspace = tmp_path / "workspace"
+    source = workspace / "uploads" / "report.pdf"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"%PDF-1.4")
+    other_cwd = tmp_path / "service-cwd"
+    other_cwd.mkdir()
+    monkeypatch.setenv("FLOCKS_WORKSPACE_DIR", str(workspace))
+    monkeypatch.chdir(other_cwd)
+    try:
+        resolved = doc_parser_module._resolve_input_path("uploads/report.pdf")
+    finally:
+        WorkspaceManager._instance = previous_instance
+
+    assert resolved == source.resolve()
 
 
 @pytest.mark.asyncio
@@ -126,6 +145,27 @@ def test_normalize_markdown_preserves_fenced_code_block(doc_parser_module):
 
     assert "    print(1)" in normalized
     assert "    print(2)" in normalized
+
+
+def test_docx_xml_fallback_preserves_soft_line_breaks(tmp_path, doc_parser_module):
+    source = tmp_path / "soft-break.docx"
+    document = textwrap.dedent("""\
+        <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+        <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+          <w:body>
+            <w:p>
+              <w:r><w:t>第一行</w:t></w:r>
+              <w:r><w:br/></w:r>
+              <w:r><w:t>第二行</w:t></w:r>
+            </w:p>
+          </w:body>
+        </w:document>
+    """)
+    _write_minimal_docx(source, document_xml=document)
+
+    content = doc_parser_module._extract_docx_with_zipxml(source)
+
+    assert "第一行\n第二行" in content
 
 
 def test_doc_fallback_prefers_pandoc_before_olefile(monkeypatch, tmp_path, doc_parser_module):

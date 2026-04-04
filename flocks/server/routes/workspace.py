@@ -80,9 +80,9 @@ def _is_allowed_upload_filename(filename: str) -> bool:
     return Path(filename).suffix.lower() in _ALLOWED_UPLOAD_EXTENSIONS
 
 
-def _resolve_upload_target(dest_dir: Path, filename: str) -> Path:
+def _resolve_upload_target(dest_dir: Path, filename: str, *, auto_rename: bool) -> Path:
     candidate = dest_dir / Path(filename).name
-    if not candidate.exists():
+    if not auto_rename or not candidate.exists():
         return candidate
 
     stem = candidate.stem
@@ -286,7 +286,7 @@ async def upload_files(
             continue
 
         content = b"".join(chunks)
-        target = _resolve_upload_target(dest_dir, filename)
+        target = _resolve_upload_target(dest_dir, filename, auto_rename=purpose == "chat")
         target.write_bytes(content)
 
         is_text = WorkspaceManager.is_text_file(target)
