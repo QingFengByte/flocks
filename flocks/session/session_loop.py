@@ -21,14 +21,19 @@ from flocks.utils.log import Log
 from flocks.utils.id import Identifier
 from flocks.session.session import Session, SessionInfo
 from flocks.session.message import Message, MessageInfo, MessageRole
-from flocks.session.core.status import SessionStatus, SessionStatusBusy, SessionStatusIdle, SessionStatusCompacting
+from flocks.session.core.status import SessionStatus, SessionStatusBusy, SessionStatusIdle
 from flocks.session.core.task_utils import fire_and_forget
 from flocks.session.core.turn_state import (
     set_turn_state,
     set_context_state,
     clear_turn_state,
 )
-from flocks.session.lifecycle.compaction import SessionCompaction, CompactionPolicy
+from flocks.session.lifecycle.compaction import (
+    SessionCompaction,
+    CompactionPolicy,
+    build_compaction_policy,
+    run_compaction,
+)
 from flocks.session.prompt import SessionPrompt
 from flocks.provider.provider import Provider
 
@@ -719,13 +724,15 @@ class SessionLoop:
                     
                     # Process compaction
                     try:
-                        compaction_result = await SessionCompaction.process(
-                            session_id=ctx.session.id,
-                            parent_id=last_user.id,
-                            messages=[msg.model_dump() if hasattr(msg, 'model_dump') else msg.__dict__ for msg in messages],
-                            model_id=ctx.model_id,
+                        compaction_result = await run_compaction(
+                            ctx.session.id,
+                            parent_message_id=last_user.id,
+                            messages=messages,
                             provider_id=ctx.provider_id,
+                            model_id=ctx.model_id,
                             auto=getattr(task_part, 'auto', False),
+                            event_publish_callback=callbacks.event_publish_callback if callbacks else None,
+                            status_after="busy",
                             policy=compaction_policy,
                         )
                         
@@ -958,16 +965,6 @@ class SessionLoop:
                             if callbacks.on_compaction:
                                 await callbacks.on_compaction()
                             
-                            from flocks.session.core.status import COMPACTING_DEFAULT_MESSAGE
-                            SessionStatus.set(ctx.session.id, SessionStatusCompacting(
-                                message=COMPACTING_DEFAULT_MESSAGE,
-                            ))
-                            if callbacks.event_publish_callback:
-                                await callbacks.event_publish_callback("session.status", {
-                                    "sessionID": ctx.session.id,
-                                    "status": {"type": "compacting", "message": COMPACTING_DEFAULT_MESSAGE},
-                                })
-                            
                             # Prune first, then summarize
                             await SessionCompaction.prune(
                                 ctx.session.id,
@@ -975,13 +972,15 @@ class SessionLoop:
                             )
                             
                             # Trigger compaction (summarization + memory flush)
-                            compaction_result = await SessionCompaction.process(
-                                session_id=ctx.session.id,
-                                parent_id=last_user.id,
-                                messages=[msg.model_dump() if hasattr(msg, 'model_dump') else msg.__dict__ for msg in messages],
-                                model_id=ctx.model_id,
+                            compaction_result = await run_compaction(
+                                ctx.session.id,
+                                parent_message_id=last_user.id,
+                                messages=messages,
                                 provider_id=ctx.provider_id,
+                                model_id=ctx.model_id,
                                 auto=True,
+                                event_publish_callback=callbacks.event_publish_callback if callbacks else None,
+                                status_after="busy",
                                 policy=compaction_policy,
                             )
                             ctx.last_compaction_step = ctx.step
@@ -998,14 +997,6 @@ class SessionLoop:
                                 "attempt": ctx.overflow_compaction_attempts,
                                 "cooldownUntilStep": ctx.step + POST_COMPACTION_COOLDOWN_STEPS,
                             })
-                            
-                            # --- Compaction done: restore busy status ---
-                            SessionStatus.set(ctx.session.id, SessionStatusBusy())
-                            if callbacks.event_publish_callback:
-                                await callbacks.event_publish_callback("session.status", {
-                                    "sessionID": ctx.session.id,
-                                    "status": {"type": "busy"},
-                                })
                             
                             if compaction_result == "stop":
                                 log.error("loop.compaction_failed", {"session_id": ctx.session.id})
@@ -1154,21 +1145,7 @@ class SessionLoop:
         Falls back to ``CompactionPolicy.default()`` when the model info
         cannot be resolved (e.g. unknown provider or missing context_window).
         """
-        context_window, max_output, max_input = Provider.resolve_model_info(ctx.provider_id, ctx.model_id)
-        
-        if context_window > 0:
-            return CompactionPolicy.from_model(
-                context_window=context_window,
-                max_output_tokens=max_output or 4096,
-                max_input_tokens=max_input,
-            )
-        
-        log.warn("loop.build_policy_fallback", {
-            "provider_id": ctx.provider_id,
-            "model_id": ctx.model_id,
-            "reason": "context_window not found, using default policy",
-        })
-        return CompactionPolicy.default()
+        return build_compaction_policy(ctx.provider_id, ctx.model_id)
     
     @classmethod
     def _should_exit(
