@@ -119,6 +119,12 @@ class DingTalkChannel(ChannelPlugin):
             return f"runner.ts not found: {_RUNNER_TS}"
         if not _CONNECTOR_PACKAGE.exists():
             return f"package.json not found: {_CONNECTOR_PACKAGE}"
+        node_modules = _CONNECTOR_DIR / "node_modules"
+        if not node_modules.is_dir():
+            return (
+                f"node_modules not found in {_CONNECTOR_DIR}. "
+                "Run `npm install` (or `bun install`) inside that directory first."
+            )
         return None
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
@@ -129,7 +135,14 @@ class DingTalkChannel(ChannelPlugin):
         on_message: Callable[[InboundMessage], Awaitable[None]],
         abort_event: Optional[asyncio.Event] = None,
     ) -> None:
-        """Start the runner.ts subprocess and monitor it until abort_event fires."""
+        """Start the runner.ts subprocess and monitor it until abort_event fires.
+
+        Design note: DingTalk inbound messages are handled entirely inside the
+        runner.ts ↔ plugin.ts layer, which calls the flocks Session API directly.
+        The `on_message` / InboundDispatcher path (used by Feishu, WeCom, Telegram)
+        is intentionally NOT used here; this means dedup, debounce, channel.inbound
+        hooks and session-binding are the responsibility of plugin.ts itself.
+        """
         self._config = config
         self._on_message = on_message
 
@@ -145,6 +158,12 @@ class DingTalkChannel(ChannelPlugin):
             "FLOCKS_GATEWAY_TOKEN":   config.get("gatewayToken", ""),
             "DINGTALK_DEBUG":         "true" if config.get("debug") else "false",
             "DINGTALK_ACCOUNT_ID":    config.get("_account_id", "__default__"),
+            # Optional policy / behaviour fields forwarded to plugin.ts
+            "DINGTALK_DM_POLICY":             str(config.get("dmPolicy", "")),
+            "DINGTALK_ALLOW_FROM":            ",".join(config.get("allowFrom") or []),
+            "DINGTALK_SEPARATE_SESSION":      "true" if config.get("separateSessionByConversation", True) else "false",
+            "DINGTALK_GROUP_SESSION_SCOPE":   str(config.get("groupSessionScope", "")),
+            "DINGTALK_SHARED_MEMORY":         "true" if config.get("sharedMemoryAcrossConversations") else "false",
         }
 
         log.info("dingtalk.start", {

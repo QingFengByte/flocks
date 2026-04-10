@@ -31,6 +31,14 @@ const GATEWAY_TOKEN  = process.env.FLOCKS_GATEWAY_TOKEN    || '';
 const DEBUG          = process.env.DINGTALK_DEBUG === 'true';
 const ACCOUNT_ID     = process.env.DINGTALK_ACCOUNT_ID     || '__default__';
 
+// Optional policy / behaviour fields forwarded from flocks.json → plugin.ts
+const DM_POLICY             = process.env.DINGTALK_DM_POLICY            || '';
+const ALLOW_FROM_RAW        = process.env.DINGTALK_ALLOW_FROM            || '';
+const ALLOW_FROM            = ALLOW_FROM_RAW ? ALLOW_FROM_RAW.split(',').map(s => s.trim()).filter(Boolean) : undefined;
+const SEPARATE_SESSION      = process.env.DINGTALK_SEPARATE_SESSION      !== 'false';  // default true
+const GROUP_SESSION_SCOPE   = process.env.DINGTALK_GROUP_SESSION_SCOPE   || '';
+const SHARED_MEMORY         = process.env.DINGTALK_SHARED_MEMORY         === 'true';
+
 // Proxy listens on a random port; plugin.ts's streamFromGateway calls land here
 const PROXY_HOST = '127.0.0.1';
 let   PROXY_PORT = 0;  // resolved after startup
@@ -159,6 +167,11 @@ async function* flocksToOpenAIStream(
 
       // text delta → OpenAI chunk
       if (type === 'message.part.updated') {
+        // Only consume events belonging to this session to avoid mixing
+        // deltas from concurrent DingTalk / Web / TUI conversations.
+        const eventSessionId: string = props.part?.sessionID || '';
+        if (eventSessionId && eventSessionId !== sessionId) continue;
+
         const delta: string = props.delta || '';
         const partType: string = props.part?.type || '';
         if (delta && partType === 'text') {
@@ -168,6 +181,9 @@ async function* flocksToOpenAIStream(
 
       // Inference completion signal
       if (type === 'message.updated') {
+        const eventSessionId: string = props.info?.sessionID || '';
+        if (eventSessionId && eventSessionId !== sessionId) continue;
+
         const finish = props.info?.finish;
         if (finish === 'stop' || finish === 'error') {
           finished = true;
@@ -314,6 +330,12 @@ const fakeApi: any = {
           gatewayToken: GATEWAY_TOKEN,
           debug:        DEBUG,
           ...(FLOCKS_AGENT ? { defaultAgent: FLOCKS_AGENT } : {}),
+          // Optional policy / behaviour fields (only set when non-empty / non-default)
+          ...(DM_POLICY           ? { dmPolicy: DM_POLICY }                         : {}),
+          ...(ALLOW_FROM          ? { allowFrom: ALLOW_FROM }                        : {}),
+          ...(SEPARATE_SESSION    ? {} : { separateSessionByConversation: false }),
+          ...(GROUP_SESSION_SCOPE ? { groupSessionScope: GROUP_SESSION_SCOPE }        : {}),
+          ...(SHARED_MEMORY       ? { sharedMemoryAcrossConversations: true }         : {}),
         },
       },
       gateway: { port: PROXY_PORT },
