@@ -78,12 +78,12 @@ cd flocks
 
 macOS / Linux
 ```bash
-./scripts/install.sh
+./scripts/install_zh.sh
 ```
 
 Windows PowerShell (Administrator)
 ```powershell
-powershell -ep Bypass -File .\scripts\install.ps1
+powershell -ep Bypass -File .\scripts\install_zh.ps1
 ```
 
 ---
