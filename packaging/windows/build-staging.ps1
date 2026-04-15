@@ -1,4 +1,4 @@
-# Build Tier-B staging directory: tools/ (uv, node, Chrome for Testing) + flocks/ (repository copy). No .venv — user runs bootstrap later.
+﻿# Build Tier-B staging directory: tools/ (uv, node, Chrome for Testing) + flocks/ (repository copy). No .venv — user runs bootstrap later.
 # Run on Windows (PowerShell 5+). Requires: network access, Expand-Archive, robocopy (built-in).
 #
 # Usage:
@@ -90,7 +90,7 @@ if (-not [string]::IsNullOrWhiteSpace($env:PUPPETEER_CHROME_DOWNLOAD_BASE_URL)) 
     $puppeteerEnv["PUPPETEER_CHROME_DOWNLOAD_BASE_URL"] = $env:PUPPETEER_CHROME_DOWNLOAD_BASE_URL
 }
 try {
-    $cfTResult = & $npxCmd @("--yes", "@puppeteer/browsers", "install", "chrome@stable", "--path", $toolsChrome) 2>&1
+    $cfTResult = & $npxCmd "--yes" "@puppeteer/browsers" "install" "chrome@stable" "--path" $toolsChrome 2>&1
     $cfTResult | ForEach-Object { Write-Host $_ }
     if ($LASTEXITCODE -ne 0) {
         throw "Chrome for Testing install exited with code $LASTEXITCODE"
