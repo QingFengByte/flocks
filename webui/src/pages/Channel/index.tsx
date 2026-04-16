@@ -436,7 +436,9 @@ const CHANNEL_ICON_SRC: Record<string, string> = {
 const FEISHU_GUIDE_PDF_URL = '/feishu-bot-guide.pdf';
 const FEISHU_GUIDE_PDF_FILENAME = 'feishu-bot-guide.pdf';
 const WECOM_GUIDE_PDF_URL = '/wecom-bot-guide.pdf';
-const WECOM_GUIDE_PDF_FILENAME = '企业微信配置指引.pdf';
+const WECOM_GUIDE_PDF_FILENAME = 'wecom-bot-guide.pdf';
+const DINGTALK_GUIDE_PDF_URL = '/dingtalk-channel-guide.pdf';
+const DINGTALK_GUIDE_PDF_FILENAME = 'dingtalk-channel-guide.pdf';
 
 function getChannelIcon(id: string, size: 'sm' | 'md' = 'sm') {
   const dim = size === 'md' ? 'w-10 h-10' : 'w-9 h-9';
@@ -1046,14 +1048,9 @@ function WeComPanel({ config, onChange }: WeComPanelProps) {
           />
         </FieldRow>
         <FieldRow label={t('wecom.groupTrigger')} hint={t('wecom.groupTriggerHint')}>
-          <Select
-            value={config.groupTrigger ?? 'mention'}
-            onChange={(v) => set('groupTrigger', v)}
-            options={[
-              { value: 'mention', label: t('wecom.triggerMention') },
-              { value: 'all', label: t('wecom.triggerAll') },
-            ]}
-          />
+          <span className="inline-block px-3 py-1.5 text-sm text-gray-500 border border-gray-200 rounded-md bg-gray-50">
+            {t('wecom.triggerMention')}
+          </span>
         </FieldRow>
         <FieldRow label={t('wecom.allowFrom')} hint={t('wecom.allowFromHint')}>
           <TagsInput
@@ -1110,6 +1107,11 @@ function DingTalkPanel({ config, onChange }: DingTalkPanelProps) {
   return (
     <>
       <Section title={t('dingtalk.credentials')} description={t('dingtalk.credentialsDesc')}>
+        <GuideDownloadButton
+          href={DINGTALK_GUIDE_PDF_URL}
+          download={DINGTALK_GUIDE_PDF_FILENAME}
+          label={t('dingtalk.downloadGuide')}
+        />
         <FieldRow label="Client ID" required hint={t('dingtalk.clientIdHint')}>
           <TextInput
             value={config.clientId ?? ''}
@@ -1555,6 +1557,7 @@ export default function ChannelPage() {
 
   // Track unsaved changes per channel
   const originalConfigsRef = useRef<Record<string, ChannelConfig>>({});
+  const toggleInFlightRef = useRef(false);
 
   const fetchAll = useCallback(async () => {
     try {
@@ -1577,7 +1580,11 @@ export default function ChannelPage() {
         if (ch.id === 'feishu') {
           configs[ch.id] = { ...defaultFeishuConfig(), ...saved };
         } else if (ch.id === 'wecom') {
-          configs[ch.id] = { ...defaultWeComConfig(), ...saved };
+          const wecomCfg = { ...defaultWeComConfig(), ...saved };
+          if (wecomCfg.groupTrigger && wecomCfg.groupTrigger !== 'mention') {
+            wecomCfg.groupTrigger = 'mention';
+          }
+          configs[ch.id] = wecomCfg;
         } else if (ch.id === 'dingtalk') {
           configs[ch.id] = { ...defaultDingTalkConfig(), ...saved };
         } else if (ch.id === 'telegram') {
@@ -1687,12 +1694,63 @@ export default function ChannelPage() {
     setTimeout(() => { fetchAll(); fetchStatuses(true); }, 8000);
   };
 
-  const handleToggleEnabled = (enabled: boolean) => {
-    if (!selectedId) return;
+  const refreshListAndStatus = useCallback(async () => {
+    try {
+      const res = await client.get('/api/channel/list');
+      setChannels(res.data);
+    } catch { /* list may be unavailable briefly during restart */ }
+    fetchStatuses(true);
+  }, [fetchStatuses]);
+
+  const handleToggleEnabled = async (enabled: boolean) => {
+    if (!selectedId || toggleInFlightRef.current) return;
+    toggleInFlightRef.current = true;
+
     setChannelConfigs((prev) => ({
       ...prev,
       [selectedId]: { ...prev[selectedId], enabled },
     }));
+
+    try {
+      setSavePhase('saving');
+
+      // Persist only the enabled change using the last-saved channel config,
+      // so other unsaved field edits are not accidentally flushed.
+      const savedChannelCfg = fullConfig.channels?.[selectedId] ?? {};
+      const updatedChannelCfg = { ...savedChannelCfg, enabled };
+      const updatedChannels = { ...(fullConfig.channels ?? {}), [selectedId]: updatedChannelCfg };
+      const updated = { ...fullConfig, channels: updatedChannels };
+
+      await client.patch('/api/config/', updated);
+
+      setFullConfig(updated);
+      originalConfigsRef.current = {
+        ...originalConfigsRef.current,
+        [selectedId]: { ...originalConfigsRef.current[selectedId], enabled },
+      };
+
+      const wasEnabled = (fullConfig.channels?.[selectedId] as any)?.enabled ?? false;
+      const shouldRestart = enabled || wasEnabled;
+
+      if (shouldRestart) {
+        setSavePhase('applying');
+        client.post(`/api/channel/${selectedId}/restart`, {}, { timeout: 5000 }).catch(() => {});
+        toast.success(enabled ? t('saveAndApplySuccess') : t('saveAndStopSuccess'));
+        setTimeout(refreshListAndStatus, 3000);
+        setTimeout(refreshListAndStatus, 8000);
+      } else {
+        toast.success(t('saveSucess'));
+      }
+    } catch (err: any) {
+      setChannelConfigs((prev) => ({
+        ...prev,
+        [selectedId]: { ...prev[selectedId], enabled: !enabled },
+      }));
+      toast.error(t('saveFailed'), err.message);
+    } finally {
+      toggleInFlightRef.current = false;
+      setSavePhase('idle');
+    }
   };
 
   const handleChannelConfigChange = (id: string, cfg: ChannelConfig) => {

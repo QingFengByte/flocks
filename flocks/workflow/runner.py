@@ -8,11 +8,11 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Dict, Literal, Optional, Union
+from typing import Any, Callable, Dict, Literal, Optional, Union
 
 from flocks.config.config import Config
 from flocks.sandbox.context import resolve_sandbox_context
-from .errors import FlocksWorkflowError
+from .errors import FlocksWorkflowError, RunCancelledError, RunTimeoutError
 from .io import dump_workflow, load_workflow
 from .compiler import default_exec_path, compile_workflow, workflow_has_logic_nodes
 from .models import Workflow
@@ -80,6 +80,43 @@ def _resolve_workflow_runtime_preference(tool_context: Optional[Any]) -> Literal
                 return "host"  # type: ignore[return-value]
     # sandbox.mode omitted: default to host for explicitness and consistency.
     return "host"  # type: ignore[return-value]
+
+
+def _resolve_workflow_node_timeout(
+    requested_timeout_s: Optional[float],
+    workflow_metadata: Optional[Dict[str, Any]],
+) -> Optional[float]:
+    """Resolve effective per-node timeout with workflow metadata fallback."""
+    if requested_timeout_s is None:
+        return None
+    if requested_timeout_s not in (300, 300.0):
+        return requested_timeout_s
+    if not isinstance(workflow_metadata, dict):
+        return requested_timeout_s
+
+    candidates = [
+        workflow_metadata.get("node_timeout_s"),
+        workflow_metadata.get("nodeTimeoutS"),
+    ]
+    runtime_defaults = workflow_metadata.get("runtime_defaults")
+    if isinstance(runtime_defaults, dict):
+        candidates.extend(
+            [
+                runtime_defaults.get("node_timeout_s"),
+                runtime_defaults.get("nodeTimeoutS"),
+            ]
+        )
+
+    for value in candidates:
+        if value is None:
+            continue
+        try:
+            resolved = float(value)
+        except (TypeError, ValueError):
+            continue
+        if resolved > 0:
+            return resolved
+    return requested_timeout_s
 
 
 def _resolve_sandbox_payload_from_config(tool_context: Optional[Any]) -> Optional[Dict[str, Any]]:
@@ -205,7 +242,7 @@ def run_workflow(
     workflow: WorkflowSource,
     inputs: Optional[Dict[str, Any]] = None,
     timeout_s: Optional[float] = None,
-    node_timeout_s: Optional[float] = 120.0,
+    node_timeout_s: Optional[float] = 300.0,
     trace: bool = False,
     use_llm: Optional[bool] = None,
     tool_registry: Optional[Any] = None,
@@ -215,6 +252,7 @@ def run_workflow(
     sandbox_requirements_installer: Optional[SandboxRequirementsInstaller] = None,
     on_step_complete: Optional[Any] = None,
     max_parallel_workers: int = 4,
+    cancel: Optional[Callable[[], bool]] = None,
 ) -> RunWorkflowResult:
     # 确保日志已配置
     _ensure_logging_configured()
@@ -294,6 +332,11 @@ def run_workflow(
     except Exception:
         pass
 
+    effective_node_timeout_s = _resolve_workflow_node_timeout(
+        node_timeout_s,
+        wf.metadata,
+    )
+
     reqs = requirements_from_workflow_metadata(wf.metadata)
     if ensure_requirements:
         _logger.info("检查依赖包...")
@@ -329,14 +372,20 @@ def run_workflow(
             (requirements_installer or RequirementsInstaller(installer="auto")).ensure_installed(reqs)
         rt = PythonExecRuntime(tool_registry=registry)
     
-    _logger.info(f"创建执行引擎 (use_llm={effective_use_llm}, trace={trace}, node_timeout={node_timeout_s}s, parallel_workers={max_parallel_workers})")
+    _logger.info(
+        "创建执行引擎 (use_llm=%s, trace=%s, node_timeout=%ss, parallel_workers=%s)",
+        effective_use_llm,
+        trace,
+        effective_node_timeout_s,
+        max_parallel_workers,
+    )
     engine = WorkflowEngine(
         wf,
         runtime=rt,
         use_llm=bool(effective_use_llm),
         trace=trace,
         workflow_path=workflow_path_for_engine,
-        node_timeout_s=node_timeout_s,
+        node_timeout_s=effective_node_timeout_s,
         max_parallel_workers=max_parallel_workers,
     )
     
@@ -357,6 +406,7 @@ def run_workflow(
         result = engine.run(
             initial_inputs=initial_inputs,
             timeout_s=timeout_s,
+            cancel=cancel,
             on_step_start=_on_step_start,
             on_step_end=_on_step_end,
         )
@@ -371,8 +421,14 @@ def run_workflow(
         
         last_outputs = history_from_error[-1].get('outputs', {}) if history_from_error else {}
         
+        status = "FAILED"
+        if isinstance(e, RunCancelledError):
+            status = "CANCELLED"
+        elif isinstance(e, RunTimeoutError):
+            status = "TIMED_OUT"
+
         return RunWorkflowResult(
-            status="FAILED", 
+            status=status,
             error=f"{type(e).__name__}: {e}",
             run_id=exec_ctx.get('run_id'),
             steps=exec_ctx.get('steps', 0),

@@ -107,6 +107,13 @@ def _get_inline_provider_api_key(provider_id: str) -> Optional[str]:
     return api_key
 
 
+def _get_provider_custom_settings(provider: Any) -> Dict[str, Any]:
+    """Return the currently applied provider custom settings, if any."""
+    provider_config = getattr(provider, "_config", None)
+    custom_settings = getattr(provider_config, "custom_settings", None) or {}
+    return dict(custom_settings) if isinstance(custom_settings, dict) else {}
+
+
 def _model_to_api_format(model: ProviderModelInfo) -> Dict[str, Any]:
     """Convert internal ModelInfo to Flocks-compatible dict format.
 
@@ -848,11 +855,13 @@ class APIServiceSummary(BaseModel):
     description: Optional[str] = None
     description_cn: Optional[str] = None
     builtin: bool = False
+    verify_ssl: bool = False
 
 
 class APIServiceUpdateRequest(BaseModel):
     """API service update request."""
     enabled: bool = Field(..., description="Enable or disable the API service")
+    verify_ssl: Optional[bool] = Field(None, description="SSL verification for HTTP requests (default: False)")
 
 
 class APIServiceCredentialField(BaseModel):
@@ -1233,6 +1242,13 @@ def _build_api_service_summary(
     matched_tools = _get_api_service_tool_infos(provider_id)
 
     status = "disabled" if not enabled else cached_status.get("status", "unknown")
+    raw_config = ConfigWriter.get_api_service_raw(provider_id) or {}
+    # "verify_ssl" is canonical; fall back to legacy "ssl_verify" for backward compatibility
+    verify_ssl_raw = raw_config.get("verify_ssl", raw_config.get("ssl_verify", meta.get("verify_ssl", False)))
+    if isinstance(verify_ssl_raw, str):
+        verify_ssl = verify_ssl_raw.strip().lower() in {"1", "true", "yes", "on"}
+    else:
+        verify_ssl = bool(verify_ssl_raw)
     return APIServiceSummary(
         id=provider_id,
         name=meta.get("name", provider_id),
@@ -1245,6 +1261,7 @@ def _build_api_service_summary(
         description=meta.get("description"),
         description_cn=meta.get("description_cn"),
         builtin=_is_api_service_builtin(provider_id, matched_tools),
+        verify_ssl=verify_ssl,
     )
 
 
@@ -1278,6 +1295,8 @@ async def update_api_service(provider_id: str, request: APIServiceUpdateRequest)
     try:
         existing = ConfigWriter.get_api_service_raw(provider_id) or {}
         existing["enabled"] = request.enabled
+        if request.verify_ssl is not None:
+            existing["verify_ssl"] = request.verify_ssl
         ConfigWriter.set_api_service(provider_id, existing)
 
         matched_count = _set_api_service_tools_enabled(provider_id, request.enabled)
@@ -1298,6 +1317,7 @@ async def update_api_service(provider_id: str, request: APIServiceUpdateRequest)
         log.info("api_service.updated", {
             "provider_id": provider_id,
             "enabled": request.enabled,
+            "verify_ssl": request.verify_ssl,
             "matched_tools": matched_count,
         })
         return _build_api_service_summary(provider_id, statuses)
@@ -1705,10 +1725,12 @@ async def set_provider_credentials(provider_id: str, request: ProviderCredential
                 if raw:
                     effective_base_url = raw.get("options", {}).get("baseURL")
 
+            custom_settings = _get_provider_custom_settings(provider)
             provider.configure(ProviderConfig(
                 provider_id=provider_id,
                 api_key=request.api_key,
                 base_url=effective_base_url,
+                custom_settings=custom_settings,
             ))
             # Reset client so it picks up new base_url/key
             if hasattr(provider, "_client"):
@@ -2038,17 +2060,27 @@ async def test_provider_credentials(provider_id: str, body: Optional[TestCredent
         start = time.time()
         
         # test-credentials handles both LLM providers and API services.
-        # Try _llm_key first (LLM provider), then _api_key (API service fallback).
+        # Try _llm_key first (LLM provider), then all secret fields defined
+        # in the credential schema (api_key, password, token, etc.).
         secrets = get_secret_manager()
         secret_id = f"{provider_id}_llm_key"
         api_key = secrets.get(secret_id)
         if not api_key:
             raw_service = ConfigWriter.get_api_service_raw(provider_id) or {}
             secret_id = None
-            for candidate in _get_api_service_secret_candidates(provider_id, raw_service):
-                api_key = secrets.get(candidate)
+            metadata = _load_api_service_metadata_data(provider_id) or {}
+            secret_field_names = _get_api_service_secret_field_names(provider_id, metadata)
+            if not secret_field_names:
+                secret_field_names = ["api_key"]
+            for field_name in secret_field_names:
+                for candidate in _get_api_service_secret_candidates(
+                    provider_id, raw_service, field_name=field_name
+                ):
+                    api_key = secrets.get(candidate)
+                    if api_key:
+                        secret_id = candidate
+                        break
                 if api_key:
-                    secret_id = candidate
                     break
         if not api_key:
             api_key = _get_inline_provider_api_key(provider_id)
@@ -2087,10 +2119,12 @@ async def test_provider_credentials(provider_id: str, body: Optional[TestCredent
                 base_url_attr = getattr(provider, "_base_url", None)
                 if isinstance(base_url_attr, str) and base_url_attr:
                     effective_base_url = base_url_attr
+            custom_settings = _get_provider_custom_settings(provider)
             provider.configure(ProviderConfig(
                 provider_id=provider_id,
                 api_key=api_key,
                 base_url=effective_base_url,
+                custom_settings=custom_settings,
             ))
             if hasattr(provider, '_client'):
                 provider._client = None

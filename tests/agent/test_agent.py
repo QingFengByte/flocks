@@ -18,7 +18,7 @@ from flocks.session.prompt_strings import PROMPT_COMPACTION, PROMPT_TITLE, PROMP
 BUILTIN_AGENTS = [
     "rex", "hephaestus", "plan", "explore",
     "oracle", "librarian", "metis", "momus", "multimodal-looker",
-    "self-enhance", "rex-junior", "host-forensics",
+    "self-enhance", "rex-junior", "host-forensics", "host-forensics-fast",
 ]
 
 
@@ -102,7 +102,7 @@ class TestSubagents:
 
     @pytest.mark.asyncio
     async def test_security_agents(self):
-        for name in ["host-forensics"]:
+        for name in ["host-forensics", "host-forensics-fast"]:
             agent = await Agent.get(name)
             assert agent is not None
             assert agent.mode == "subagent"
@@ -184,21 +184,21 @@ class TestAgentListing:
 class TestAgentPermissions:
 
     @pytest.mark.asyncio
-    async def test_explore_permissions(self):
+    async def test_explore_tools(self):
         """explore agent only allows declared read/search tools."""
-        assert await Agent.check_permission("explore", "grep") == "allow"
-        assert await Agent.check_permission("explore", "glob") == "allow"
-        assert await Agent.check_permission("explore", "list") == "allow"
-        assert await Agent.check_permission("explore", "read") == "allow"
-        assert await Agent.check_permission("explore", "websearch") == "allow"
+        assert await Agent.has_tool("explore", "grep") is True
+        assert await Agent.has_tool("explore", "glob") is True
+        assert await Agent.has_tool("explore", "list") is True
+        assert await Agent.has_tool("explore", "read") is True
+        assert await Agent.has_tool("explore", "websearch") is True
         # write tools denied
-        assert await Agent.check_permission("explore", "write") == "deny"
-        assert await Agent.check_permission("explore", "edit") == "deny"
-        assert await Agent.check_permission("explore", "bash") == "allow"
+        assert await Agent.has_tool("explore", "write") is False
+        assert await Agent.has_tool("explore", "edit") is False
+        assert await Agent.has_tool("explore", "bash") is True
 
     @pytest.mark.asyncio
-    async def test_nonexistent_agent_permission(self):
-        assert await Agent.check_permission("nonexistent", "read") == "deny"
+    async def test_nonexistent_agent_has_no_tool(self):
+        assert await Agent.has_tool("nonexistent", "read") is False
 
 
 # =============================================================================

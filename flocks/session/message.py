@@ -585,6 +585,39 @@ class Message:
         
         model_class = type_map.get(part_type, TextPart)
         return model_class.model_validate(part_data)
+
+    @staticmethod
+    def _normalize_assistant_message(message: MessageInfo) -> MessageInfo:
+        """Coerce assistant fields back to typed models before serialization."""
+        if not isinstance(message, AssistantMessageInfo):
+            return message
+
+        updates: Dict[str, Any] = {}
+        if isinstance(message.tokens, dict):
+            updates["tokens"] = TokenUsage.model_validate(message.tokens)
+        if isinstance(message.path, dict):
+            updates["path"] = MessagePath.model_validate(message.path)
+
+        if not updates:
+            return message
+        return message.model_copy(update=updates)
+
+    @classmethod
+    def _normalize_message_patch(
+        cls,
+        message: MessageInfo,
+        patch: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Coerce typed assistant fields when update callers pass plain dicts."""
+        if not isinstance(message, AssistantMessageInfo):
+            return patch
+
+        normalized = dict(patch)
+        if isinstance(normalized.get("tokens"), dict):
+            normalized["tokens"] = TokenUsage.model_validate(normalized["tokens"])
+        if isinstance(normalized.get("path"), dict):
+            normalized["path"] = MessagePath.model_validate(normalized["path"])
+        return normalized
     
     @classmethod
     async def _persist_messages(cls, session_id: str) -> None:
@@ -596,7 +629,13 @@ class Message:
         """
         storage_key = f"{cls._MESSAGE_PREFIX}:{session_id}"
         messages = cls._messages_cache.get(session_id, [])
-        await Storage.set(storage_key, [m.model_dump() for m in messages])
+        serialized_messages = []
+        for index, message in enumerate(messages):
+            normalized = cls._normalize_assistant_message(message)
+            if normalized is not message:
+                messages[index] = normalized
+            serialized_messages.append(normalized.model_dump())
+        await Storage.set(storage_key, serialized_messages)
     
     @classmethod
     async def _persist_parts(cls, session_id: str, *, message_id: Optional[str] = None) -> None:
@@ -1258,8 +1297,11 @@ class Message:
                     
                     if status == "completed":
                         output = getattr(state, "output", "")
+                        metadata = getattr(state, "metadata", {}) or {}
                         time_info = getattr(state, "time", {})
-                        if isinstance(time_info, dict) and time_info.get("compacted"):
+                        if metadata.get("context_compact_placeholder"):
+                            output = str(metadata["context_compact_placeholder"])
+                        elif isinstance(time_info, dict) and time_info.get("compacted"):
                             output = "[Tool output compacted]"
                         content_parts.append({
                             "type": "tool-result",
@@ -1328,7 +1370,10 @@ class Message:
             if part.type == "tool" and hasattr(part, 'state'):
                 if part.state.status == "completed":
                     time_info = getattr(part.state, 'time', None)
-                    if isinstance(time_info, dict) and time_info.get("compacted"):
+                    metadata = getattr(part.state, 'metadata', None) or {}
+                    if metadata.get("context_compact_placeholder"):
+                        output = str(metadata["context_compact_placeholder"])
+                    elif isinstance(time_info, dict) and time_info.get("compacted"):
                         output = "[Tool output compacted]"
                     else:
                         output = part.state.output
@@ -1423,6 +1468,7 @@ class Message:
             
             # Build update dict (skip None values)
             patch = {k: v for k, v in updates.items() if v is not None}
+            patch = cls._normalize_message_patch(message, patch)
             
             # Update timestamp
             time_data = message.time if hasattr(message, 'time') else message.model_dump().get("time", {})

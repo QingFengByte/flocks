@@ -47,13 +47,31 @@ export interface WorkflowEdge {
   const?: Record<string, any>;
 }
 
+export interface WorkflowOutputSchema {
+  type?: string | string[];
+  title?: string;
+  description?: string;
+  properties?: Record<string, WorkflowOutputSchema>;
+  required?: string[];
+  items?: WorkflowOutputSchema | WorkflowOutputSchema[];
+  enum?: Array<string | number | boolean | null>;
+  additionalProperties?: boolean | WorkflowOutputSchema;
+  [key: string]: any;
+}
+
+export interface WorkflowMetadata {
+  sampleInputs?: Record<string, any>;
+  outputSchema?: WorkflowOutputSchema;
+  [key: string]: any;
+}
+
 export interface WorkflowJSON {
   version?: string;
   name?: string;
   start: string;
   nodes: WorkflowNode[];
   edges: WorkflowEdge[];
-  metadata?: Record<string, any>;
+  metadata?: WorkflowMetadata;
 }
 
 export interface Workflow {
@@ -79,17 +97,39 @@ export interface Workflow {
   };
 }
 
+export interface WorkflowExecutionStep {
+  node_id: string;
+  node_type?: string;
+  type?: string;
+  inputs: Record<string, any>;
+  outputs: Record<string, any>;
+  stdout?: string;
+  error?: string;
+  traceback?: string;
+  duration_ms?: number;
+}
+
 export interface WorkflowExecution {
   id: string;
   workflowId: string;
   inputParams: Record<string, any>;
   outputResults?: Record<string, any>;
-  status: 'running' | 'success' | 'error' | 'timeout';
+  status: 'running' | 'success' | 'error' | 'timeout' | 'cancelled';
   startedAt: number;
   finishedAt?: number;
   duration?: number;
-  executionLog: any[];
+  executionLog: WorkflowExecutionStep[];
   errorMessage?: string;
+}
+
+export interface WorkflowNodeExecution {
+  node_id: string;
+  outputs: Record<string, any>;
+  stdout: string;
+  error?: string;
+  traceback?: string;
+  duration_ms?: number;
+  success: boolean;
 }
 
 export interface WorkflowService {
@@ -146,6 +186,11 @@ export const workflowAPI = {
   
   getExecution: (workflowId: string, execId: string) =>
     client.get<WorkflowExecution>(`/api/workflow/${workflowId}/history/${execId}`),
+
+  cancelExecution: (workflowId: string, execId: string) =>
+    client.post<{ status: string; message: string; executionId: string }>(
+      `/api/workflow/${workflowId}/history/${execId}/cancel`
+    ),
   
   getStats: (id: string) =>
     client.get(`/api/workflow/${id}/stats`),
@@ -190,15 +235,7 @@ export const workflowAPI = {
     } | null>(`/api/workflow/${id}/kafka-config`),
 
   runNode: (id: string, data: { nodeId: string; inputs?: Record<string, any> }) =>
-    client.post<{
-      node_id: string;
-      outputs: Record<string, any>;
-      stdout: string;
-      error?: string;
-      traceback?: string;
-      duration_ms?: number;
-      success: boolean;
-    }>(`/api/workflow/${id}/run-node`, { node_id: data.nodeId, inputs: data.inputs ?? {} }),
+    client.post<WorkflowNodeExecution>(`/api/workflow/${id}/run-node`, { node_id: data.nodeId, inputs: data.inputs ?? {} }),
 
   getSampleInputs: (id: string) =>
     client.get<{ sampleInputs: Record<string, any> }>(`/api/workflow/${id}/sample-inputs`),

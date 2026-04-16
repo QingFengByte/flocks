@@ -60,6 +60,14 @@ async def lifespan(app: FastAPI):
         log.warning("updater.leftovers.cleanup_failed", {"error": str(e)})
 
     try:
+        from flocks.updater.updater import _get_repo_root, _refresh_global_cli_entry
+
+        await asyncio.to_thread(_refresh_global_cli_entry, _get_repo_root())
+        log.info("cli.global_entry.refreshed")
+    except Exception as e:
+        log.warning("cli.global_entry.refresh_failed", {"error": str(e)})
+
+    try:
         init_observability()
         log.info("observability.initialized")
     except Exception as e:
@@ -102,6 +110,15 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         log.warning("credential.env_migration.failed", {"error": str(e)})
 
+    # Sync new catalog models into flocks.json for existing providers (idempotent)
+    try:
+        from flocks.provider.model_catalog import sync_catalog_models_to_config
+        synced = sync_catalog_models_to_config()
+        if synced > 0:
+            log.info("catalog.model_sync.done", {"models_added": synced})
+    except Exception as e:
+        log.warning("catalog.model_sync.failed", {"error": str(e)})
+
     # Load custom providers from flocks.json into runtime
     try:
         from flocks.server.routes.custom_provider import load_custom_providers_on_startup
@@ -133,6 +150,8 @@ async def lifespan(app: FastAPI):
         await TaskManager.start()
         log.info("task_manager.started")
     except Exception as e:
+        from flocks.task.manager import TaskManager
+        TaskManager.mark_start_failed(e)
         log.warning("task_manager.start.failed", {"error": str(e)})
 
     # Seed built-in scheduled tasks from .flocks/plugins/tasks/*.json (idempotent)
@@ -501,7 +520,7 @@ from flocks.server.routes.custom_provider import router as custom_provider_route
 # Onboarding routes
 from flocks.server.routes.onboarding import router as onboarding_router
 # Task Center routes
-from flocks.server.routes.task import router as task_router
+from flocks.server.routes.task_entities import router as task_entities_router
 # Background Task routes (agent-spawned async tasks)
 from flocks.server.routes.background_task import router as background_task_router
 # Channel routes (webhook + status)
@@ -550,7 +569,7 @@ app.include_router(event_router, prefix="/api/event", tags=["Event"])
 # WebUI: Question reply routes (for production reverse proxies forwarding /api/*)
 app.include_router(question_router, prefix="/api/question", tags=["Question"])
 # Task Center
-app.include_router(task_router, prefix="/api/tasks", tags=["Task"])
+app.include_router(task_entities_router, prefix="/api", tags=["TaskV2"])
 # Background Tasks (agent-spawned async tasks)
 app.include_router(background_task_router, prefix="/api/background-task", tags=["BackgroundTask"])
 # Channel (webhook callbacks + status)

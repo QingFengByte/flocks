@@ -19,8 +19,8 @@ def test_bash_installer_stops_processes_before_retrying_locked_operations() -> N
     assert 'flocks stop >/dev/null 2>&1 || true' in script
     assert "list_flocks_process_ids()" in script
     assert "is_lock_error_output()" in script
-    assert 'run_with_lock_retry "Python 后端依赖安装" uv sync --group dev' in script
-    assert 'run_with_lock_retry "flocks 全局 CLI 安装" uv tool install --editable "$ROOT_DIR" --force' in script
+    assert 'run_with_lock_retry "Python backend dependency installation" uv sync --group dev' in script
+    assert 'ln -sf "$target" "$link_dir/flocks"' in script
     assert "os\\ error\\ 5" in script
     assert 'pkill -f "uv sync"' not in script
     assert 'pkill -f "npm run preview"' not in script
@@ -33,6 +33,7 @@ def test_powershell_installer_stops_processes_before_retrying_locked_operations(
     script = (SCRIPT_DIR / "install.ps1").read_text(encoding="utf-8-sig")
 
     assert "function Stop-FlocksProcesses" in script
+    assert "function Initialize-InstallSources" in script
     assert "function Invoke-NativeCommand" in script
     assert "& $flocksCommand.Source stop" in script
     assert 'Join-Path $runDir "upgrade_server.pid"' in script
@@ -41,10 +42,10 @@ def test_powershell_installer_stops_processes_before_retrying_locked_operations(
     assert "-RedirectStandardOutput $stdoutPath" in script
     assert "-RedirectStandardError $stderrPath" in script
     assert "Invoke-InstallerCommandWithLockRetry" in script
-    assert "$result = Invoke-NativeCommandOrFail" in script
+    assert "$process = Start-Process" in script
     assert "$null = Invoke-NativeCommandOrFail" in script
-    assert '-Description "Python 后端依赖安装"' in script
-    assert '-Description "flocks 全局 CLI 安装"' in script
+    assert '-Description "Python backend dependency installation"' in script
+    assert "flocks.cmd" in script
     assert "Failed to update Windows PE resources" in script
     assert '& $ScriptBlock 2>&1' not in script
     assert "Stop-FlocksProcesses -Aggressive" not in script
@@ -95,6 +96,14 @@ if (-not $paths[2].EndsWith([IO.Path]::DirectorySeparatorChar + 'run' + [IO.Path
 
 def test_bootstrap_powershell_installer_uses_utf8_without_bom_with_crlf() -> None:
     data = (REPO_ROOT / "install.ps1").read_bytes()
+
+    assert not data.startswith(b"\xef\xbb\xbf")
+    assert b"\r\n" in data
+    assert b"\n" not in data.replace(b"\r\n", b"")
+
+
+def test_bootstrap_powershell_install_zh_uses_utf8_without_bom_with_crlf() -> None:
+    data = (REPO_ROOT / "install_zh.ps1").read_bytes()
 
     assert not data.startswith(b"\xef\xbb\xbf")
     assert b"\r\n" in data

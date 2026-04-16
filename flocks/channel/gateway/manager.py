@@ -35,6 +35,7 @@ class GatewayManager:
     def __init__(self, registry: Optional[ChannelRegistry] = None) -> None:
         self._registry = registry or default_registry
         self._running: dict[str, asyncio.Task] = {}
+        self._running_plugins: dict[str, ChannelPlugin] = {}
         self._abort_events: dict[str, asyncio.Event] = {}
         self._dispatcher: Optional[InboundDispatcher] = None
         self._started_at: Optional[float] = None
@@ -78,12 +79,13 @@ class GatewayManager:
                     channel_id=channel_id,
                     plugin=plugin,
                     config=config_dict,
-                    on_message=self._dispatcher.dispatch,
+                    on_message=self._make_on_message(plugin, self._dispatcher.dispatch),
                     abort_event=abort_event,
                 ),
                 name=f"channel-{channel_id}",
             )
             self._running[channel_id] = task
+            self._running_plugins[channel_id] = plugin
             log.info("gateway.channel_started", {"channel": channel_id})
 
     async def stop_all(self) -> None:
@@ -101,7 +103,7 @@ class GatewayManager:
                 await asyncio.gather(*pending, return_exceptions=True)
 
         for channel_id in list(self._running.keys()):
-            plugin = self._registry.get(channel_id)
+            plugin = self._running_plugins.get(channel_id) or self._registry.get(channel_id)
             if plugin:
                 try:
                     await plugin.stop()
@@ -111,6 +113,7 @@ class GatewayManager:
                     })
 
         self._running.clear()
+        self._running_plugins.clear()
         self._abort_events.clear()
 
         try:
@@ -123,7 +126,9 @@ class GatewayManager:
         """Snapshot of every running channel's health status."""
         result: dict[str, ChannelStatus] = {}
         for channel_id in self._running:
-            plugin = self._registry.get(channel_id)
+            # Use the plugin instance the running task holds, not the registry's
+            # latest instance (registry may have been updated by the file watcher).
+            plugin = self._running_plugins.get(channel_id) or self._registry.get(channel_id)
             if plugin:
                 status = plugin.status
                 if status.started_at:
@@ -177,12 +182,13 @@ class GatewayManager:
                 channel_id=channel_id,
                 plugin=plugin,
                 config=config_dict,
-                on_message=self._dispatcher.dispatch,
+                on_message=self._make_on_message(plugin, self._dispatcher.dispatch),
                 abort_event=abort_event,
             ),
             name=f"channel-{channel_id}",
         )
         self._running[channel_id] = task
+        self._running_plugins[channel_id] = plugin
         log.info("gateway.channel_started", {"channel": channel_id})
 
     async def stop_channel(self, channel_id: str) -> None:
@@ -198,7 +204,7 @@ class GatewayManager:
             except (asyncio.TimeoutError, Exception):
                 task.cancel()
 
-        plugin = self._registry.get(channel_id)
+        plugin = self._running_plugins.pop(channel_id, None) or self._registry.get(channel_id)
         if plugin:
             try:
                 await plugin.stop()
@@ -286,6 +292,11 @@ class GatewayManager:
                 delay = self.RECONNECT_BASE_DELAY
                 attempt += 1
 
+                # Brief pause before retrying a clean exit to avoid busy-looping
+                # when the remote connection drops immediately after connect.
+                if await self._sleep_or_abort(abort_event, self.RECONNECT_BASE_DELAY):
+                    break
+
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -316,6 +327,23 @@ class GatewayManager:
     # ------------------------------------------------------------------
     # Reconnect helpers
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _make_on_message(
+        plugin: ChannelPlugin,
+        dispatch: Callable,
+    ) -> Callable:
+        """Wrap *dispatch* so that each inbound message records a timestamp."""
+        async def _on_message(msg) -> None:
+            plugin.record_message()
+            await dispatch(msg)
+        return _on_message
+
+    def record_message(self, channel_id: str) -> None:
+        """Update last_message_at on a running channel plugin (e.g. from an HTTP handler)."""
+        plugin = self._running_plugins.get(channel_id) or self._registry.get(channel_id)
+        if plugin:
+            plugin.record_message()
 
     @staticmethod
     async def _mark_connected(plugin: ChannelPlugin, channel_id: str) -> None:

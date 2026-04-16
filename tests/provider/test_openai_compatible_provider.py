@@ -1,8 +1,10 @@
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
+from types import SimpleNamespace
 
 import pytest
 
 from flocks.provider.provider import ChatMessage, ChatResponse
+from flocks.provider.provider import ProviderConfig
 from flocks.provider.sdk.openai_compatible import OpenAICompatibleProvider
 
 
@@ -26,6 +28,34 @@ def _mock_chat_response(content: str = "Paris"):
     return response
 
 
+class TestOpenAICompatibleProviderConfiguration:
+    @patch("httpx.AsyncClient")
+    @patch("openai.AsyncOpenAI")
+    def test_get_client_respects_verify_ssl_false(self, mock_async_openai, mock_http_client):
+        provider = OpenAICompatibleProvider()
+        provider.configure(
+            ProviderConfig(
+                provider_id=provider.id,
+                api_key="test-api-key",
+                base_url="https://gateway.internal/v1",
+                custom_settings={"verify_ssl": False},
+            )
+        )
+
+        http_client = MagicMock()
+        mock_http_client.return_value = http_client
+        mock_async_openai.return_value = MagicMock()
+
+        provider._get_client()
+
+        mock_http_client.assert_called_once_with(verify=False, timeout=120.0)
+        mock_async_openai.assert_called_once_with(
+            api_key="test-api-key",
+            base_url="https://gateway.internal/v1",
+            http_client=http_client,
+        )
+
+
 def _chat_response(content: str, model: str = "MiniMax-M2.5") -> ChatResponse:
     return ChatResponse(
         id="resp_fallback",
@@ -39,6 +69,11 @@ def _chat_response(content: str, model: str = "MiniMax-M2.5") -> ChatResponse:
 async def _empty_stream():
     if False:
         yield None
+
+
+async def _stream_from_chunks(*chunks):
+    for chunk in chunks:
+        yield chunk
 
 
 class TestOpenAICompatibleProviderTemperature:
@@ -167,3 +202,110 @@ class TestOpenAICompatibleProviderMiniMaxFallback:
 
         assert [chunk.delta for chunk in chunks] == ["Recovered generic fallback"]
         sleep_mock.assert_not_awaited()
+
+
+class TestOpenAICompatibleProviderStreamingUsage:
+    @pytest.mark.asyncio
+    async def test_chat_stream_includes_usage_in_terminal_chunk(self):
+        provider, create = _build_provider_with_client()
+        create.return_value = _stream_from_chunks(
+            SimpleNamespace(
+                choices=[],
+                usage=SimpleNamespace(prompt_tokens=13, completion_tokens=8, total_tokens=21),
+            ),
+            SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        delta=SimpleNamespace(content="hello", tool_calls=None),
+                        finish_reason="stop",
+                    )
+                ],
+                usage=None,
+            ),
+        )
+
+        chunks = [
+            chunk
+            async for chunk in provider.chat_stream(
+                "kimi-k2.5",
+                [ChatMessage(role="user", content="hello")],
+            )
+        ]
+
+        assert create.await_args.kwargs["stream_options"] == {"include_usage": True}
+        assert chunks[-1].finish_reason == "stop"
+        assert chunks[-1].usage == {
+            "prompt_tokens": 13,
+            "completion_tokens": 8,
+            "total_tokens": 21,
+        }
+
+    @pytest.mark.asyncio
+    async def test_chat_stream_emits_trailing_usage_when_usage_only_chunk_arrives_after_finish(self):
+        provider, create = _build_provider_with_client()
+        create.return_value = _stream_from_chunks(
+            SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        delta=SimpleNamespace(content="hello", tool_calls=None),
+                        finish_reason="stop",
+                    )
+                ],
+                usage=None,
+            ),
+            SimpleNamespace(
+                choices=[],
+                usage=SimpleNamespace(prompt_tokens=13, completion_tokens=8, total_tokens=21),
+            ),
+        )
+
+        chunks = [
+            chunk
+            async for chunk in provider.chat_stream(
+                "kimi-k2.5",
+                [ChatMessage(role="user", content="hello")],
+            )
+        ]
+
+        assert any(chunk.finish_reason == "stop" for chunk in chunks)
+        assert chunks[-1].usage == {
+            "prompt_tokens": 13,
+            "completion_tokens": 8,
+            "total_tokens": 21,
+        }
+        assert chunks[-1].finish_reason is None
+
+    @pytest.mark.asyncio
+    async def test_chat_stream_retries_without_stream_options_when_unsupported(self):
+        provider, create = _build_provider_with_client()
+        create.side_effect = [
+            ValueError("unsupported parameter: include_usage"),
+            _stream_from_chunks(
+                SimpleNamespace(
+                    choices=[
+                        SimpleNamespace(
+                            delta=SimpleNamespace(content="hello", tool_calls=None),
+                            finish_reason="stop",
+                        )
+                    ],
+                    usage=SimpleNamespace(prompt_tokens=5, completion_tokens=2, total_tokens=7),
+                )
+            ),
+        ]
+
+        chunks = [
+            chunk
+            async for chunk in provider.chat_stream(
+                "kimi-k2.5",
+                [ChatMessage(role="user", content="hello")],
+            )
+        ]
+
+        assert create.await_count == 2
+        assert "stream_options" in create.await_args_list[0].kwargs
+        assert "stream_options" not in create.await_args_list[1].kwargs
+        assert chunks[-1].usage == {
+            "prompt_tokens": 5,
+            "completion_tokens": 2,
+            "total_tokens": 7,
+        }

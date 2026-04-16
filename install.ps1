@@ -15,6 +15,33 @@ $DefaultBranch = if ([string]::IsNullOrWhiteSpace($env:FLOCKS_DEFAULT_BRANCH)) {
 $DefaultInstallDir = Join-Path (Get-Location) "flocks"
 $InstallDir = if ([string]::IsNullOrWhiteSpace($env:FLOCKS_INSTALL_DIR)) { $DefaultInstallDir } else { $env:FLOCKS_INSTALL_DIR }
 
+function Test-IsWindowsPlatform {
+    return [System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT
+}
+
+function Test-IsAdministrator {
+    if (-not (Test-IsWindowsPlatform)) {
+        return $true
+    }
+
+    try {
+        $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+        $principal = New-Object Security.Principal.WindowsPrincipal($identity)
+        return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    }
+    catch {
+        return $false
+    }
+}
+
+function Assert-Administrator {
+    if (Test-IsAdministrator) {
+        return
+    }
+
+    Fail "Administrator privileges are required. Reopen PowerShell as Administrator and rerun this installer."
+}
+
 function Write-Info {
     param([string]$Message)
     Write-Host "[flocks-bootstrap] $Message"
@@ -37,6 +64,7 @@ function Show-Usage {
     Write-Host "This script downloads the GitHub source archive to a temporary directory,"
     Write-Host "copies it to a persistent install location, and delegates to scripts/install.ps1."
     Write-Host "By default it creates a 'flocks' subdirectory under the current directory."
+    Write-Host "Run this installer in a PowerShell window opened as Administrator."
     Write-Host ""
     Write-Host "Remote usage:"
     Write-Host '  powershell -c "irm https://raw.githubusercontent.com/AgentFlocks/Flocks/main/install.ps1 | iex"'
@@ -83,7 +111,7 @@ function Invoke-WorkspaceInstaller {
     )
 
     if ([string]::IsNullOrWhiteSpace($InstallerPath)) {
-        Fail "安装脚本路径为空。"
+        Fail "Installer path is empty."
     }
 
     & powershell -NoProfile -ExecutionPolicy Bypass -File $InstallerPath @InstallerArgs
@@ -111,7 +139,7 @@ function Download-Archive {
     $lastErrorMessage = $null
 
     foreach ($url in Get-ArchiveCandidateUrls) {
-        Write-Info "尝试下载源码包: $url"
+        Write-Info "Trying source archive URL: $url"
         try {
             Invoke-WebRequest -UseBasicParsing -Uri $url -OutFile $ArchivePath
             return $url
@@ -121,7 +149,7 @@ function Download-Archive {
         }
     }
 
-    Fail "无法从 GitHub 下载版本 '$Version' 的源码包。最后一次错误: $lastErrorMessage"
+    Fail "Failed to download source archive for version '$Version' from GitHub. Last error: $lastErrorMessage"
 }
 
 function Resolve-ProjectRoot {
@@ -144,26 +172,28 @@ function Main {
         return
     }
 
+    Assert-Administrator
+
     $tempDir = New-TemporaryDirectory
     $archivePath = Join-Path $tempDir "flocks.zip"
 
     try {
-        Write-Info "仓库: $RepoSlug"
-        Write-Info "版本: $Version"
-        Write-Info "临时目录: $tempDir"
+        Write-Info "Repository: $RepoSlug"
+        Write-Info "Version: $Version"
+        Write-Info "Temporary directory: $tempDir"
 
         $downloadUrl = Download-Archive -ArchivePath $archivePath
 
-        Write-Info "解压源码包..."
+        Write-Info "Extracting source archive..."
         Expand-Archive -Path $archivePath -DestinationPath $tempDir -Force
 
         $projectRoot = Resolve-ProjectRoot -TempDir $tempDir
         if ([string]::IsNullOrWhiteSpace($projectRoot)) {
-            Fail "解压完成，但未找到 scripts\install.ps1。"
+            Fail "Archive extracted, but scripts\install.ps1 was not found."
         }
 
         $installParent = Split-Path -Parent $InstallDir
-        if (-not [string]::IsNullOrWhiteSpace($installParent)) {
+        if ((-not [string]::IsNullOrWhiteSpace($installParent)) -and -not (Test-Path -LiteralPath $installParent)) {
             New-Item -ItemType Directory -Path $installParent -Force | Out-Null
         }
         if (Test-Path $InstallDir) {
@@ -173,9 +203,9 @@ function Main {
         Unblock-InstallFiles -TargetDir $InstallDir
 
         $installerPath = Join-Path $InstallDir "scripts\install.ps1"
-        Write-Info "下载来源: $downloadUrl"
-        Write-Info "安装目录: $InstallDir"
-        Write-Info "转调安装脚本: $installerPath"
+        Write-Info "Downloaded from: $downloadUrl"
+        Write-Info "Install directory: $InstallDir"
+        Write-Info "Delegating to installer: $installerPath"
 
         $installerArgs = @()
         if ($InstallTui) {

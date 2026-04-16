@@ -17,10 +17,11 @@
  */
 
 import { useState, useCallback, useRef, useEffect, useMemo, memo } from 'react';
-import { Send, Loader2, ChevronDown, Square, Copy, User } from 'lucide-react';
+import { Send, Loader2, ChevronDown, Square, Copy, User, Plus, FileText, AlertCircle, X, RefreshCw, Pencil, Save } from 'lucide-react';
 import { StreamingMarkdown } from './StreamingMarkdown';
 import { useTranslation } from 'react-i18next';
 import LoadingSpinner from './LoadingSpinner';
+import { useToast } from './Toast';
 import { QuestionTool } from './QuestionTool';
 import DelegateTaskCard, { isDelegateTool } from './DelegateTaskCard';
 import CommandDropdown, { parseSlashCommand } from './CommandDropdown';
@@ -28,8 +29,11 @@ import { useSessionMessages } from '@/hooks/useSessions';
 import { useSSE, type SSEConnectionStatus } from '@/hooks/useSSE';
 import { useReasoningToggle } from '@/hooks/useReasoningToggle';
 import { usePendingQuestions, type PendingQuestion } from '@/hooks/usePendingQuestions';
+import { sessionApi } from '@/api/session';
 import client from '@/api/client';
 import { commandAPI, type Command } from '@/api/skill';
+import { workspaceAPI } from '@/api/workspace';
+import { copyText } from '@/utils/clipboard';
 import { formatSmartTime } from '@/utils/time';
 import type { Message, MessagePart, ToolState } from '@/types';
 
@@ -105,7 +109,18 @@ export interface SessionChatProps {
    * Called when the user sends a message but sessionId is not yet available.
    * The parent should create a session and update sessionId + initialMessage props.
    */
-  onCreateAndSend?: (text: string) => void;
+  onCreateAndSend?: (text: string) => Promise<void> | void;
+}
+
+type AttachmentStatus = 'uploading' | 'success' | 'error';
+
+interface ComposerAttachment {
+  id: string;
+  file: File;
+  name: string;
+  status: AttachmentStatus;
+  workspacePath?: string;
+  error?: string;
 }
 
 // ============================================================================
@@ -148,6 +163,34 @@ export function mergeConsecutiveAssistantMessages(messages: Message[]): MergedMe
   return result;
 }
 
+export function getMessageBubbleClassName({
+  compact,
+  isUser,
+  isEditing,
+}: {
+  compact: boolean;
+  isUser: boolean;
+  isEditing: boolean;
+}): string {
+  if (compact) {
+    return `max-w-[90%] px-4 py-3 rounded-xl text-sm break-words ${
+      isUser
+        ? 'bg-gradient-to-br from-slate-50 to-gray-100 border border-slate-200 text-gray-900 shadow-sm'
+        : 'bg-white border border-gray-200 shadow-sm'
+    }`;
+  }
+
+  const widthClass = isUser
+    ? (isEditing ? 'max-w-2xl w-full' : 'max-w-2xl w-auto')
+    : 'max-w-2xl w-full';
+
+  return `${widthClass} px-6 py-4 rounded-2xl text-sm break-words ${
+    isUser
+      ? 'bg-gradient-to-br from-slate-50 to-gray-100 border border-slate-200 text-gray-900 shadow-sm'
+      : 'bg-white border border-gray-200 shadow-sm hover:shadow-md transition-shadow duration-200'
+  }`;
+}
+
 // ============================================================================
 // Main component
 // ============================================================================
@@ -155,6 +198,21 @@ export function mergeConsecutiveAssistantMessages(messages: Message[]): MergedMe
 const ABORT_SSE_SETTLE_DELAY = 2000;
 const SCROLL_BOTTOM_THRESHOLD_PX = 80;
 const FALLBACK_POLL_MS = 5_000;
+const WORKSPACE_UPLOAD_DEST = 'uploads';
+const FILE_INPUT_ACCEPT = '.txt,.md,.json,.yaml,.yml,.xml,.csv,.pdf,.doc,.docx';
+const ALLOWED_UPLOAD_EXTENSIONS = new Set([
+  'txt', 'md', 'json', 'yaml', 'yml', 'xml', 'csv', 'pdf', 'doc', 'docx',
+]);
+
+function getFileExtension(filename: string): string {
+  const normalized = filename.toLowerCase();
+  const idx = normalized.lastIndexOf('.');
+  return idx >= 0 ? normalized.slice(idx + 1) : '';
+}
+
+function isAllowedUploadFile(file: File): boolean {
+  return ALLOWED_UPLOAD_EXTENSIONS.has(getFileExtension(file.name));
+}
 
 export default function SessionChat({
   sessionId,
@@ -178,6 +236,8 @@ export default function SessionChat({
   onInitialMessageConsumed,
 }: SessionChatProps) {
   const { t } = useTranslation('session');
+  const { t: tCommon } = useTranslation('common');
+  const toast = useToast();
   const compact = display?.compact ?? true;
   const showActions = display?.showActions ?? false;
   const showTimestamp = display?.showTimestamp ?? false;
@@ -186,8 +246,15 @@ export default function SessionChat({
   const [input, setInput] = useState('');
   const [sending, setSending] = useState(false);
   const [isStreaming, setIsStreaming] = useState(false);
+  const [attachments, setAttachments] = useState<ComposerAttachment[]>([]);
+  const [isDragOver, setIsDragOver] = useState(false);
   const [isCompacting, setIsCompacting] = useState(false);
   const [compactingMessage, setCompactingMessage] = useState('');
+  const [editingMessageId, setEditingMessageId] = useState<string | null>(null);
+  const [editingPartId, setEditingPartId] = useState<string | null>(null);
+  const [editingRole, setEditingRole] = useState<Message['role'] | null>(null);
+  const [editingText, setEditingText] = useState('');
+  const [actionMessageId, setActionMessageId] = useState<string | null>(null);
   const isCompactingRef = useRef(false);
   const prevStreamingRef = useRef(false);
   // Tracks "sessionId::message" key to prevent double-send in React StrictMode
@@ -209,6 +276,7 @@ export default function SessionChat({
   const scrollContainerRef = useRef<HTMLDivElement>(null);
   const isAtBottomRef = useRef(true);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
   const isComposingRef = useRef(false);
 
   // Slash command autocomplete state
@@ -217,6 +285,12 @@ export default function SessionChat({
   const [commandQuery, setCommandQuery] = useState('');
   const [selectedCommandIndex, setSelectedCommandIndex] = useState(0);
   const commandsLoadedRef = useRef(false);
+  const successfulAttachments = useMemo(
+    () => attachments.filter((attachment) => attachment.status === 'success' && attachment.workspacePath),
+    [attachments],
+  );
+  const hasUploadingFiles = attachments.some((attachment) => attachment.status === 'uploading');
+  const canSend = !sending && !isStreaming && !hasUploadingFiles && (!!input.trim() || successfulAttachments.length > 0);
 
   const scrollToBottom = useCallback(() => {
     if (!isAtBottomRef.current) return;
@@ -238,7 +312,16 @@ export default function SessionChat({
     });
   }, []);
 
-  const { messages, loading, refetch, addMessage, updateMessage, updateMessagePart } =
+  const {
+    messages,
+    loading,
+    refetch,
+    addMessage,
+    updateMessage,
+    updateMessagePart,
+    replaceMessageText,
+    truncateAfterMessage,
+  } =
     useSessionMessages(sessionId || undefined);
 
   // Keep a ref to latest messages so handleAbort can read it without stale closure
@@ -388,6 +471,8 @@ export default function SessionChat({
   // Reset state on session change
   useEffect(() => {
     setIsStreaming(false);
+    setAttachments([]);
+    setIsDragOver(false);
     setIsCompacting(false);
     setCompactingMessage('');
     abortingRef.current = false;
@@ -469,6 +554,159 @@ export default function SessionChat({
       commandsLoadedRef.current = false; // Allow retry on failure
     }
   }, []);
+
+  const buildAttachmentBlock = useCallback((items: ComposerAttachment[]) => {
+    if (items.length === 0) return '';
+    const lines = items
+      .map((attachment) => attachment.workspacePath)
+      .filter((path): path is string => Boolean(path))
+      .map((path) => `- ${path}`);
+    if (lines.length === 0) return '';
+    return `Attached files:\n${lines.join('\n')}`;
+  }, []);
+
+  const buildMessageText = useCallback((rawText: string, items: ComposerAttachment[]) => {
+    const attachmentBlock = buildAttachmentBlock(items);
+    const content = rawText
+      ? attachmentBlock
+        ? `${rawText}\n\n${attachmentBlock}`
+        : rawText
+      : attachmentBlock;
+
+    if (!content) return '';
+    return nodeRef
+      ? `@@node:${nodeRef.id}|${nodeRef.type}\n${content}`
+      : content;
+  }, [buildAttachmentBlock, nodeRef]);
+
+  const updateAttachment = useCallback((id: string, updater: (attachment: ComposerAttachment) => ComposerAttachment) => {
+    setAttachments((prev) => prev.map((attachment) => (
+      attachment.id === id ? updater(attachment) : attachment
+    )));
+  }, []);
+
+  const uploadSelectedFiles = useCallback(async (entries: Array<{ id: string; file: File }>) => {
+    if (entries.length === 0) return;
+    try {
+      const response = await workspaceAPI.upload(
+        entries.map((entry) => entry.file),
+        WORKSPACE_UPLOAD_DEST,
+        'chat',
+      );
+      const uploaded = response.data.uploaded ?? [];
+      setAttachments((prev) => prev.map((attachment) => {
+        const entryIndex = entries.findIndex((entry) => entry.id === attachment.id);
+        if (entryIndex < 0) return attachment;
+        const result = uploaded[entryIndex];
+        if (!result || result.error || !result.path) {
+          return {
+            ...attachment,
+            status: 'error',
+            error: result?.error || t('chat.upload.errorGeneric'),
+          };
+        }
+        return {
+          ...attachment,
+          name: result.name || attachment.name,
+          status: 'success',
+          workspacePath: result.path,
+          error: undefined,
+        };
+      }));
+    } catch (err: any) {
+      const detail = err?.response?.data?.detail ?? err?.message ?? t('chat.upload.errorGeneric');
+      setAttachments((prev) => prev.map((attachment) => (
+        entries.some((entry) => entry.id === attachment.id)
+          ? { ...attachment, status: 'error', error: detail }
+          : attachment
+      )));
+    }
+  }, [t]);
+
+  const queueFilesForUpload = useCallback((files: File[]) => {
+    if (files.length === 0) return;
+    const validEntries: Array<{ id: string; file: File }> = [];
+    const invalidAttachments: ComposerAttachment[] = [];
+
+    files.forEach((file, index) => {
+      const id = `attachment-${Date.now()}-${index}-${Math.random().toString(36).slice(2, 8)}`;
+      if (!isAllowedUploadFile(file)) {
+        invalidAttachments.push({
+          id,
+          file,
+          name: file.name,
+          status: 'error',
+          error: t('chat.upload.invalidType'),
+        });
+        return;
+      }
+      validEntries.push({ id, file });
+    });
+
+    if (invalidAttachments.length > 0) {
+      setAttachments((prev) => [...prev, ...invalidAttachments]);
+    }
+
+    if (validEntries.length === 0) return;
+
+    setAttachments((prev) => [
+      ...prev,
+      ...validEntries.map(({ id, file }) => ({
+        id,
+        file,
+        name: file.name,
+        status: 'uploading' as const,
+      })),
+    ]);
+
+    void uploadSelectedFiles(validEntries);
+  }, [t, uploadSelectedFiles]);
+
+  const handleFileSelection = useCallback((fileList: FileList | null) => {
+    if (!fileList || fileList.length === 0) return;
+    queueFilesForUpload(Array.from(fileList));
+  }, [queueFilesForUpload]);
+
+  const handleRetryAttachment = useCallback((attachmentId: string) => {
+    const attachment = attachments.find((item) => item.id === attachmentId);
+    if (!attachment) return;
+    updateAttachment(attachmentId, (current) => ({
+      ...current,
+      status: 'uploading',
+      error: undefined,
+    }));
+    void uploadSelectedFiles([{ id: attachment.id, file: attachment.file }]);
+  }, [attachments, updateAttachment, uploadSelectedFiles]);
+
+  const handleRemoveAttachment = useCallback((attachmentId: string) => {
+    setAttachments((prev) => prev.filter((attachment) => attachment.id !== attachmentId));
+  }, []);
+
+  const handleComposerPaste = useCallback((event: React.ClipboardEvent<HTMLTextAreaElement>) => {
+    const files = Array.from(event.clipboardData?.files ?? []);
+    if (files.length === 0) return;
+    event.preventDefault();
+    queueFilesForUpload(files);
+  }, [queueFilesForUpload]);
+
+  const handleComposerDragOver = useCallback((event: React.DragEvent<HTMLDivElement>) => {
+    if (!Array.from(event.dataTransfer?.types ?? []).includes('Files')) return;
+    event.preventDefault();
+    setIsDragOver(true);
+  }, []);
+
+  const handleComposerDragLeave = useCallback((event: React.DragEvent<HTMLDivElement>) => {
+    if (!event.currentTarget.contains(event.relatedTarget as Node | null)) {
+      setIsDragOver(false);
+    }
+  }, []);
+
+  const handleComposerDrop = useCallback((event: React.DragEvent<HTMLDivElement>) => {
+    if (event.dataTransfer.files.length === 0) return;
+    event.preventDefault();
+    setIsDragOver(false);
+    handleFileSelection(event.dataTransfer.files);
+  }, [handleFileSelection]);
 
   /**
    * Execute a slash command via the dedicated command API.
@@ -557,13 +795,17 @@ export default function SessionChat({
   };
 
   const handleSend = async () => {
-    if (!input.trim() || sending) return;
+    if (!canSend) return;
     const rawText = input.trim();
+    const attachmentsToSend = [...successfulAttachments];
+    const text = buildMessageText(rawText, attachmentsToSend);
+    if (!text) return;
+
     setInput('');
     setShowCommandDropdown(false);
 
     // Route slash commands through the command API (requires an active session)
-    const parsed = parseSlashCommand(rawText);
+    const parsed = attachmentsToSend.length === 0 ? parseSlashCommand(rawText) : null;
     if (parsed) {
       if (!sessionId) {
         // Slash commands need an existing session; restore input and do nothing
@@ -578,17 +820,14 @@ export default function SessionChat({
       return;
     }
 
-    const text = nodeRef
-      ? `@@node:${nodeRef.id}|${nodeRef.type}\n${rawText}`
-      : rawText;
-
     if (!sessionId) {
       if (onCreateAndSend) {
         setSending(true);
         try {
           await onCreateAndSend(text);
+          setAttachments([]);
         } catch {
-          setInput(text);
+          setInput(rawText);
         } finally {
           setSending(false);
         }
@@ -598,8 +837,9 @@ export default function SessionChat({
 
     try {
       await sendText(text);
+      setAttachments([]);
     } catch {
-      setInput(text);
+      setInput(rawText);
     }
   };
 
@@ -705,9 +945,138 @@ export default function SessionChat({
   }, [isStreaming, sessionId, refetch]);
 
   // Copy text to clipboard
-  const handleCopy = useCallback((text: string) => {
-    navigator.clipboard.writeText(text).catch(() => {});
+  const handleCopy = useCallback(async (text: string) => {
+    try {
+      await copyText(text);
+      toast.success(tCommon('clipboard.copySuccessTitle'));
+    } catch (error) {
+      toast.error(
+        tCommon('clipboard.copyFailedTitle'),
+        error instanceof Error ? error.message : tCommon('clipboard.copyFailedDescription'),
+      );
+    }
+  }, [tCommon, toast]);
+
+  const resetEditingState = useCallback(() => {
+    setEditingMessageId(null);
+    setEditingPartId(null);
+    setEditingRole(null);
+    setEditingText('');
+    setActionMessageId(null);
   }, []);
+
+  const reportActionError = useCallback((fallback: string, err: unknown) => {
+    const message = err instanceof Error ? err.message : fallback;
+    onError?.(message);
+    if (!onError) {
+      alert(message);
+    }
+  }, [onError]);
+
+  const beginMessageEdit = useCallback((
+    targetMessageId: string,
+    targetPartId: string,
+    role: Message['role'],
+    rawText: string,
+  ) => {
+    setEditingMessageId(targetMessageId);
+    setEditingPartId(targetPartId);
+    setEditingRole(role);
+    setEditingText(rawText);
+    setActionMessageId(null);
+  }, []);
+
+  const handleSaveEditedMessage = useCallback(async () => {
+    if (!sessionId || !editingMessageId || !editingPartId || !editingRole) return;
+    const text = editingText.trim();
+    if (!text) return;
+
+    setActionMessageId(editingMessageId);
+    try {
+      await sessionApi.updateMessagePart(sessionId, editingMessageId, editingPartId, {
+        id: editingPartId,
+        messageID: editingMessageId,
+        sessionID: sessionId,
+        type: 'text',
+        text,
+      });
+      replaceMessageText(editingMessageId, editingPartId, text);
+      resetEditingState();
+    } catch (err) {
+      reportActionError(t('chat.errors.saveFailed'), err);
+    } finally {
+      setActionMessageId(null);
+    }
+  }, [
+    editingMessageId,
+    editingPartId,
+    editingRole,
+    editingText,
+    replaceMessageText,
+    reportActionError,
+    resetEditingState,
+    sessionId,
+    t,
+  ]);
+
+  const handleSendEditedUserMessage = useCallback(async () => {
+    if (!sessionId || !editingMessageId || !editingPartId || editingRole !== 'user') return;
+    const text = editingText.trim();
+    if (!text) return;
+
+    abortingRef.current = false;
+    isAtBottomRef.current = true;
+    setActionMessageId(editingMessageId);
+    try {
+      await sessionApi.resendMessage(sessionId, editingMessageId, editingPartId, text);
+      replaceMessageText(editingMessageId, editingPartId, text);
+      truncateAfterMessage(editingMessageId);
+      setIsStreaming(true);
+      resetEditingState();
+    } catch (err) {
+      reportActionError(t('chat.errors.resendFailed'), err);
+    } finally {
+      setActionMessageId(null);
+    }
+  }, [
+    editingMessageId,
+    editingPartId,
+    editingRole,
+    editingText,
+    replaceMessageText,
+    reportActionError,
+    resetEditingState,
+    sessionId,
+    t,
+    truncateAfterMessage,
+  ]);
+
+  const handleRegenerateMessage = useCallback(async (messageId: string) => {
+    if (!sessionId) return;
+
+    abortingRef.current = false;
+    isAtBottomRef.current = true;
+    setActionMessageId(messageId);
+    try {
+      await sessionApi.regenerateMessage(sessionId, messageId);
+      truncateAfterMessage(messageId, { includeTarget: true });
+      setIsStreaming(true);
+      if (editingMessageId === messageId) {
+        resetEditingState();
+      }
+    } catch (err) {
+      reportActionError(t('chat.errors.regenerateFailed'), err);
+    } finally {
+      setActionMessageId(null);
+    }
+  }, [editingMessageId, reportActionError, resetEditingState, sessionId, t, truncateAfterMessage]);
+
+  useEffect(() => {
+    if (!editingMessageId) return;
+    if (!messages.some((message) => message.id === editingMessageId)) {
+      resetEditingState();
+    }
+  }, [editingMessageId, messages, resetEditingState]);
 
   // ── Merged messages with compaction grouping ──
   // The compaction divider is rendered at the position of the FIRST
@@ -812,6 +1181,16 @@ export default function SessionChat({
                   showTimestamp={showTimestamp}
                   compact={compact}
                   onCopy={handleCopy}
+                  editingMessageId={editingMessageId}
+                  editingText={editingText}
+                  actionsDisabled={sending || isStreaming}
+                  actionMessageId={actionMessageId}
+                  onEditStart={beginMessageEdit}
+                  onEditChange={setEditingText}
+                  onEditCancel={resetEditingState}
+                  onEditSave={handleSaveEditedMessage}
+                  onEditSend={handleSendEditedUserMessage}
+                  onRegenerate={handleRegenerateMessage}
                   compactedMessages={compactedGroupMap.get(i)}
                 />
               );
@@ -878,6 +1257,28 @@ export default function SessionChat({
       {!hideInput && (
         <div className={`flex-shrink-0 border-t border-gray-200 bg-white ${compact ? 'px-4 py-3' : 'px-6 py-4'}`}>
           <div className={`flex items-end gap-2 ${!compact ? 'max-w-3xl mx-auto w-full gap-3' : ''}`}>
+            <input
+              ref={fileInputRef}
+              type="file"
+              className="hidden"
+              accept={FILE_INPUT_ACCEPT}
+              multiple
+              onChange={(event) => {
+                handleFileSelection(event.target.files);
+                event.target.value = '';
+              }}
+            />
+            <button
+              type="button"
+              onClick={() => fileInputRef.current?.click()}
+              disabled={sending || isStreaming}
+              title={t('chat.upload.select')}
+              className={`flex-shrink-0 rounded-lg border border-gray-300 bg-white text-gray-600 hover:bg-gray-50 hover:text-gray-900 disabled:opacity-40 disabled:cursor-not-allowed transition-colors ${
+                compact ? 'w-10 h-[40px]' : 'w-12 h-[52px] rounded-xl'
+              } inline-flex items-center justify-center`}
+            >
+              <Plus className="w-4 h-4" />
+            </button>
             <div className="relative flex-1">
               <CommandDropdown
                 visible={showCommandDropdown}
@@ -890,77 +1291,151 @@ export default function SessionChat({
                   textareaRef.current?.focus();
                 }}
               />
-            <div className={`border rounded-lg focus-within:border-gray-400 focus-within:ring-2 focus-within:ring-gray-100 transition-all bg-white overflow-hidden ${
-              isCompacting ? 'border-amber-200 bg-amber-50/30' : isStreaming ? 'border-gray-200 bg-gray-50' : 'border-gray-300'
-            } ${!compact ? 'border-2 rounded-xl focus-within:ring-4' : ''}`}>
-              {/* Node reference chip */}
-              {nodeRef && (
-                <div className="flex items-center gap-1.5 px-3 pt-2.5 pb-1">
-                  <span className="w-1.5 h-1.5 rounded-full bg-slate-400 flex-shrink-0" />
-                  <code className="text-[11px] font-mono font-semibold text-slate-700 truncate flex-1">{nodeRef.id}</code>
-                  <span className="text-[10px] text-slate-400 flex-shrink-0">{nodeRef.type}</span>
-                  {onNodeRefDismiss && (
-                    <button
-                      onClick={onNodeRefDismiss}
-                      className="ml-1 text-gray-400 hover:text-gray-600 transition-colors flex-shrink-0"
-                      title={t('chat.removeNodeRef')}
-                    >
-                      <svg className="w-3 h-3" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="2.5">
-                        <path d="M4 4l8 8M12 4l-8 8" strokeLinecap="round" />
-                      </svg>
-                    </button>
-                  )}
-                </div>
-              )}
-              <div className={nodeRef ? 'px-3 pb-2.5' : `px-3 ${compact ? 'py-2' : 'py-3'}`}>
-                <textarea
-                  ref={textareaRef}
-                  value={input}
-                  onChange={(e) => {
-                    const val = e.target.value;
-                    setInput(val);
-                    const trimmed = val.trimStart();
-                    if (trimmed.startsWith('/') && !trimmed.includes(' ')) {
-                      void loadCommandsIfNeeded();
-                      const q = trimmed.slice(1);
-                      setCommandQuery(q);
-                      setSelectedCommandIndex(0);
-                      setShowCommandDropdown(true);
-                    } else {
-                      setShowCommandDropdown(false);
-                    }
-                  }}
-                  onBlur={() => { setTimeout(() => setShowCommandDropdown(false), 100); }}
-                  onCompositionStart={() => { isComposingRef.current = true; }}
-                  onCompositionEnd={() => { isComposingRef.current = false; }}
-                  onKeyDown={handleKeyDown}
-                  placeholder={
-                    isCompacting
-                      ? t('chat.placeholderCompacting')
+              <div
+                onDragOver={handleComposerDragOver}
+                onDragLeave={handleComposerDragLeave}
+                onDrop={handleComposerDrop}
+                className={`border rounded-lg focus-within:border-gray-400 focus-within:ring-2 focus-within:ring-gray-100 transition-all bg-white overflow-hidden ${
+                  isCompacting
+                    ? 'border-amber-200 bg-amber-50/30'
+                    : isDragOver
+                      ? 'border-sky-400 bg-sky-50/70 ring-2 ring-sky-100'
                       : isStreaming
-                        ? t('chat.placeholderStreaming')
-                        : nodeRef
-                          ? t('chat.placeholderNodeRef', { nodeId: nodeRef.id })
-                          : effectivePlaceholder
-                  }
-                  className={`w-full resize-none outline-none text-sm placeholder-gray-400 ${
-                    isStreaming ? 'text-gray-400 cursor-not-allowed' : 'text-gray-900'
-                  } ${!compact ? 'bg-transparent' : ''}`}
-                  style={{ minHeight: '24px', maxHeight: compact ? '96px' : '200px' }}
-                  disabled={sending || isStreaming}
-                  rows={1}
-                />
+                        ? 'border-gray-200 bg-gray-50'
+                        : 'border-gray-300'
+                } ${!compact ? 'border-2 rounded-xl focus-within:ring-4' : ''}`}
+              >
+                {/* Node reference chip */}
+                {nodeRef && (
+                  <div className="flex items-center gap-1.5 px-3 pt-2.5 pb-1">
+                    <span className="w-1.5 h-1.5 rounded-full bg-slate-400 flex-shrink-0" />
+                    <code className="text-[11px] font-mono font-semibold text-slate-700 truncate flex-1">{nodeRef.id}</code>
+                    <span className="text-[10px] text-slate-400 flex-shrink-0">{nodeRef.type}</span>
+                    {onNodeRefDismiss && (
+                      <button
+                        onClick={onNodeRefDismiss}
+                        className="ml-1 text-gray-400 hover:text-gray-600 transition-colors flex-shrink-0"
+                        title={t('chat.removeNodeRef')}
+                      >
+                        <svg className="w-3 h-3" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="2.5">
+                          <path d="M4 4l8 8M12 4l-8 8" strokeLinecap="round" />
+                        </svg>
+                      </button>
+                    )}
+                  </div>
+                )}
+                {attachments.length > 0 && (
+                  <div className={`flex flex-wrap gap-2 px-3 ${nodeRef ? 'pb-2' : 'pt-2'} ${attachments.length > 0 ? '' : 'hidden'}`}>
+                    {attachments.map((attachment) => {
+                      const isUploading = attachment.status === 'uploading';
+                      const isError = attachment.status === 'error';
+                      const attachmentPath = attachment.workspacePath ?? null;
+                      return (
+                        <div
+                          key={attachment.id}
+                          className={`inline-flex max-w-full items-center gap-2 rounded-lg border px-2.5 py-1.5 text-xs ${
+                            isError
+                              ? 'border-red-200 bg-red-50 text-red-700'
+                              : isUploading
+                                ? 'border-sky-200 bg-sky-50 text-sky-700'
+                                : 'border-gray-200 bg-gray-50 text-gray-700'
+                          }`}
+                        >
+                          {isUploading ? (
+                            <Loader2 className="w-3.5 h-3.5 animate-spin flex-shrink-0" />
+                          ) : isError ? (
+                            <AlertCircle className="w-3.5 h-3.5 flex-shrink-0" />
+                          ) : (
+                            <FileText className="w-3.5 h-3.5 flex-shrink-0" />
+                          )}
+                          <div className="min-w-0">
+                            <div className="truncate font-medium">{attachment.name}</div>
+                            {attachmentPath && (
+                              <div className="truncate text-[11px] opacity-70">{attachmentPath}</div>
+                            )}
+                            {attachment.error && (
+                              <div className="truncate text-[11px]">{attachment.error}</div>
+                            )}
+                          </div>
+                          {isError && (
+                            <button
+                              type="button"
+                              onClick={() => handleRetryAttachment(attachment.id)}
+                              className="rounded p-0.5 hover:bg-white/70 transition-colors"
+                              title={t('chat.upload.retry')}
+                            >
+                              <RefreshCw className="w-3.5 h-3.5" />
+                            </button>
+                          )}
+                          <button
+                            type="button"
+                            onClick={() => handleRemoveAttachment(attachment.id)}
+                            className="rounded p-0.5 hover:bg-white/70 transition-colors"
+                            title={t('chat.upload.remove')}
+                          >
+                            <X className="w-3.5 h-3.5" />
+                          </button>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+                {isDragOver && (
+                  <div className="px-3 pb-1 text-[11px] text-sky-600">
+                    {t('chat.upload.dropHint')}
+                  </div>
+                )}
+                <div className={nodeRef || attachments.length > 0 ? 'px-3 pb-2.5' : `px-3 ${compact ? 'py-2' : 'py-3'}`}>
+                  <textarea
+                    ref={textareaRef}
+                    value={input}
+                    onChange={(e) => {
+                      const val = e.target.value;
+                      setInput(val);
+                      const trimmed = val.trimStart();
+                      if (trimmed.startsWith('/') && !trimmed.includes(' ') && successfulAttachments.length === 0) {
+                        void loadCommandsIfNeeded();
+                        const q = trimmed.slice(1);
+                        setCommandQuery(q);
+                        setSelectedCommandIndex(0);
+                        setShowCommandDropdown(true);
+                      } else {
+                        setShowCommandDropdown(false);
+                      }
+                    }}
+                    onBlur={() => { setTimeout(() => setShowCommandDropdown(false), 100); }}
+                    onCompositionStart={() => { isComposingRef.current = true; }}
+                    onCompositionEnd={() => { isComposingRef.current = false; }}
+                    onPaste={handleComposerPaste}
+                    onKeyDown={handleKeyDown}
+                    placeholder={
+                      isCompacting
+                        ? t('chat.placeholderCompacting')
+                        : isStreaming
+                          ? t('chat.placeholderStreaming')
+                          : nodeRef
+                            ? t('chat.placeholderNodeRef', { nodeId: nodeRef.id })
+                            : effectivePlaceholder
+                    }
+                    className={`w-full resize-none outline-none text-sm placeholder-gray-400 ${
+                      isStreaming ? 'text-gray-400 cursor-not-allowed' : 'text-gray-900'
+                    } ${!compact ? 'bg-transparent' : ''}`}
+                    style={{ minHeight: '24px', maxHeight: compact ? '96px' : '200px' }}
+                    disabled={sending || isStreaming}
+                    rows={1}
+                  />
+                </div>
               </div>
-            </div>
             </div>
             <button
               onClick={handleSend}
-              disabled={sending || isStreaming || !input.trim()}
+              disabled={!canSend}
               className={`flex-shrink-0 bg-red-600 text-white rounded-lg hover:bg-red-700 disabled:opacity-40 disabled:cursor-not-allowed flex items-center gap-1 text-sm transition-colors ${
                 compact ? 'px-3 py-2 h-[40px]' : 'px-6 py-3 h-[52px] rounded-xl shadow-md hover:shadow-lg'
               }`}
+              title={hasUploadingFiles ? t('chat.upload.waiting') : undefined}
             >
-              {sending ? <Loader2 className="w-4 h-4 animate-spin" /> : <Send className="w-4 h-4" />}
+              {sending || hasUploadingFiles ? <Loader2 className="w-4 h-4 animate-spin" /> : <Send className="w-4 h-4" />}
             </button>
             {isStreaming && (
               <button
@@ -994,6 +1469,16 @@ export interface ChatMessageBubbleProps {
   showTimestamp?: boolean;
   compact?: boolean;
   onCopy?: (text: string) => void;
+  editingMessageId?: string | null;
+  editingText?: string;
+  actionsDisabled?: boolean;
+  actionMessageId?: string | null;
+  onEditStart?: (messageId: string, partId: string, role: Message['role'], rawText: string) => void;
+  onEditChange?: (text: string) => void;
+  onEditCancel?: () => void;
+  onEditSave?: () => Promise<void>;
+  onEditSend?: () => Promise<void>;
+  onRegenerate?: (messageId: string) => Promise<void>;
   /** Compacted messages that precede this summary message */
   compactedMessages?: MergedMessage[];
 }
@@ -1008,6 +1493,16 @@ function ChatMessageBubbleInner({
   showTimestamp = false,
   compact = true,
   onCopy,
+  editingMessageId,
+  editingText = '',
+  actionsDisabled = false,
+  actionMessageId,
+  onEditStart,
+  onEditChange,
+  onEditCancel,
+  onEditSave,
+  onEditSend,
+  onRegenerate,
   compactedMessages,
 }: ChatMessageBubbleProps) {
   const { t } = useTranslation('session');
@@ -1028,6 +1523,16 @@ function ChatMessageBubbleInner({
                 showTimestamp={showTimestamp}
                 compact={compact}
                 onCopy={onCopy}
+                editingMessageId={editingMessageId}
+                editingText={editingText}
+                actionsDisabled={actionsDisabled}
+                actionMessageId={actionMessageId}
+                onEditStart={onEditStart}
+                onEditChange={onEditChange}
+                onEditCancel={onEditCancel}
+                onEditSave={onEditSave}
+                onEditSend={onEditSend}
+                onRegenerate={onRegenerate}
               />
             ))}
           </div>
@@ -1044,21 +1549,30 @@ function ChatMessageBubbleInner({
       .map((p) => p.text)
       .join('\n\n');
 
-  const bubbleClass = compact
-    ? `max-w-[90%] px-4 py-3 rounded-xl text-sm break-words ${
-        isUser
-          ? 'bg-gradient-to-br from-slate-50 to-gray-100 border border-slate-200 text-gray-900 shadow-sm'
-          : 'bg-white border border-gray-200 shadow-sm'
-      }`
-    : `${isUser ? 'max-w-2xl w-auto' : 'max-w-2xl w-full'} px-6 py-4 rounded-2xl text-sm break-words ${
-        isUser
-          ? 'bg-gradient-to-br from-slate-50 to-gray-100 border border-slate-200 text-gray-900 shadow-sm'
-          : 'bg-white border border-gray-200 shadow-sm hover:shadow-md transition-shadow duration-200'
-      }`;
+  const editableTextParts = parts.filter((part): part is MessagePart & { text: string } =>
+    part.type === 'text' && typeof part.text === 'string',
+  );
+  const latestEditablePart = editableTextParts.length > 0 ? editableTextParts[editableTextParts.length - 1] : null;
+  const targetMessageId = String((latestEditablePart as any)?.messageID || message.id);
+  const targetPartId = latestEditablePart?.id || null;
+  const editableRawText = latestEditablePart?.text || '';
+  const isEditing = !!targetPartId && editingMessageId === targetMessageId;
+  const isActionPending = actionMessageId === targetMessageId;
+
+  const bubbleClass = getMessageBubbleClassName({ compact, isUser, isEditing });
+  const actionBarClass = `absolute bottom-0 z-10 flex items-center gap-1.5 transition-all duration-150 ${
+    isUser ? 'right-3 translate-x-0.5 translate-y-1/2' : 'left-3 -translate-x-0.5 translate-y-1/2'
+  } ${
+    isEditing
+      ? 'opacity-100 pointer-events-auto'
+      : 'opacity-0 pointer-events-none group-hover:opacity-100 group-hover:pointer-events-auto'
+  }`;
+  const iconButtonClass = 'group/action relative inline-flex h-6 w-6 items-center justify-center rounded-full border border-gray-200/90 bg-white text-gray-500 shadow-[0_6px_18px_rgba(15,23,42,0.08)] backdrop-blur-sm transition-all duration-150 hover:-translate-y-px hover:border-gray-300 hover:text-gray-900 disabled:opacity-40 disabled:cursor-not-allowed';
+  const tooltipClass = 'pointer-events-none absolute bottom-full left-1/2 z-10 mb-1.5 -translate-x-1/2 whitespace-nowrap rounded-md bg-gray-900 px-2 py-1 text-[11px] font-medium text-white opacity-0 shadow-sm transition-opacity duration-150 group-hover/action:opacity-100';
 
   return (
-    <div className={`flex ${isUser ? 'justify-end' : 'justify-start'} ${!compact ? 'group w-full' : ''}`}>
-      <div className={bubbleClass} style={{ overflowWrap: 'anywhere' }}>
+    <div className={`group relative flex ${isUser ? 'justify-end' : 'justify-start'} ${!compact ? 'w-full' : ''}`}>
+      <div className={`${bubbleClass} relative`} style={{ overflowWrap: 'anywhere' }}>
         {/* Role badge */}
         <div className={`text-xs font-medium mb-2 flex items-center ${compact ? 'gap-1.5' : 'gap-2'}`}>
           {isUser ? (
@@ -1091,89 +1605,100 @@ function ChatMessageBubbleInner({
         )}
 
         {/* Parts */}
-        {parts.map((part: MessagePart, i: number) => (
-          <div key={part.id || i}>
-            {/* Text */}
-            {part.type === 'text' && part.text && (() => {
-              const nodeRefMatch = isUser
-                ? part.text.match(/^@@node:([^|\n]+)\|([^\n]+)\n([\s\S]*)$/)
-                : null;
-              const displayText = nodeRefMatch ? nodeRefMatch[3] : part.text;
-              return (
-                <>
-                  {nodeRefMatch && (
-                    <div className="flex items-center gap-1.5 mb-2 bg-gray-100 border border-gray-200 rounded-md px-2 py-1">
-                      <span className="w-1.5 h-1.5 rounded-full bg-gray-400 flex-shrink-0" />
-                      <code className="text-[10px] font-mono font-semibold text-gray-700 truncate">{nodeRefMatch[1]}</code>
-                      <span className="text-[9px] text-gray-500 flex-shrink-0">{nodeRefMatch[2]}</span>
-                    </div>
-                  )}
-                  <StreamingMarkdown
-                    content={displayText}
-                    isStreaming={isActive && !isUser}
-                  />
-                </>
-              );
-            })()}
-
-            {/* Tool call */}
-            {part.type === 'tool' && (
-              <ChatToolPart
-                part={part}
-                pendingQuestion={part.callID ? pendingQuestions?.[part.callID] : undefined}
-                onAnswer={onQuestionAnswer && part.callID
-                  ? (answers) => onQuestionAnswer(part.callID!, pendingQuestions![part.callID!].requestId, answers)
-                  : undefined}
-                onReject={onQuestionReject && part.callID
-                  ? () => onQuestionReject(part.callID!, pendingQuestions![part.callID!].requestId)
-                  : undefined}
-              />
-            )}
-
-            {/* Reasoning / thinking */}
-            {(part.type === 'reasoning' || part.type === 'thinking') && (part.text || part.thinking) && (() => {
-              const thinkingText = part.text || part.thinking || '';
-              const partKey = part.id || `reasoning-${i}`;
-              const isExpanded = getPartExpanded(partKey);
-              const isThinking = !isReasoningDone;
-              const partLabel = isThinking
-                ? `💭 ${t('chat.thinking')}`
-                : `💭 ${thinkingText.slice(0, 60)}${thinkingText.length > 60 ? '...' : ''}`;
-              return (
-                <div className="mt-2">
-                  <button
-                    onClick={() => togglePart(partKey)}
-                    disabled={isThinking}
-                    className={`flex items-center gap-1.5 px-2 py-1 rounded-md border text-xs font-medium transition-colors w-full text-left
-                      ${isThinking
-                        ? 'bg-purple-50 border-purple-200 text-purple-700 cursor-default'
-                        : 'bg-purple-50 hover:bg-purple-100 border-purple-200 text-purple-900 cursor-pointer'
-                      }`}
-                  >
-                    {isThinking && (
-                      <span className="flex gap-0.5 mr-1">
-                        <span className="w-1 h-1 bg-purple-400 rounded-full animate-bounce" style={{ animationDelay: '0ms' }} />
-                        <span className="w-1 h-1 bg-purple-400 rounded-full animate-bounce" style={{ animationDelay: '150ms' }} />
-                        <span className="w-1 h-1 bg-purple-400 rounded-full animate-bounce" style={{ animationDelay: '300ms' }} />
-                      </span>
-                    )}
-                    {partLabel}
-                    {!isThinking && (
-                      <ChevronDown
-                        className={`w-3 h-3 ml-auto text-purple-600 transition-transform ${isExpanded ? '' : '-rotate-90'}`}
-                      />
-                    )}
-                  </button>
-                  {isExpanded && (
-                    <div className="mt-1 p-2 bg-purple-50/50 rounded-md border border-purple-100 text-xs text-purple-800 whitespace-pre-wrap font-mono leading-relaxed">
-                      {thinkingText}
-                    </div>
-                  )}
-                </div>
-              );
-            })()}
+        {isEditing ? (
+          <div className="space-y-3">
+            <textarea
+              value={editingText}
+              onChange={(event) => onEditChange?.(event.target.value)}
+              rows={Math.min(12, Math.max(4, editingText.split('\n').length + 1))}
+              className="w-full rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm text-gray-900 shadow-sm focus:border-gray-400 focus:outline-none focus:ring-2 focus:ring-gray-100"
+            />
           </div>
-        ))}
+        ) : (
+          parts.map((part: MessagePart, i: number) => (
+            <div key={part.id || i}>
+              {/* Text */}
+              {part.type === 'text' && part.text && (() => {
+                const nodeRefMatch = isUser
+                  ? part.text.match(/^@@node:([^|\n]+)\|([^\n]+)\n([\s\S]*)$/)
+                  : null;
+                const displayText = nodeRefMatch ? nodeRefMatch[3] : part.text;
+                return (
+                  <>
+                    {nodeRefMatch && (
+                      <div className="flex items-center gap-1.5 mb-2 bg-gray-100 border border-gray-200 rounded-md px-2 py-1">
+                        <span className="w-1.5 h-1.5 rounded-full bg-gray-400 flex-shrink-0" />
+                        <code className="text-[10px] font-mono font-semibold text-gray-700 truncate">{nodeRefMatch[1]}</code>
+                        <span className="text-[9px] text-gray-500 flex-shrink-0">{nodeRefMatch[2]}</span>
+                      </div>
+                    )}
+                    <StreamingMarkdown
+                      content={displayText}
+                      isStreaming={isActive && !isUser}
+                    />
+                  </>
+                );
+              })()}
+
+              {/* Tool call */}
+              {part.type === 'tool' && (
+                <ChatToolPart
+                  part={part}
+                  pendingQuestion={part.callID ? pendingQuestions?.[part.callID] : undefined}
+                  onAnswer={onQuestionAnswer && part.callID
+                    ? (answers) => onQuestionAnswer(part.callID!, pendingQuestions![part.callID!].requestId, answers)
+                    : undefined}
+                  onReject={onQuestionReject && part.callID
+                    ? () => onQuestionReject(part.callID!, pendingQuestions![part.callID!].requestId)
+                    : undefined}
+                />
+              )}
+
+              {/* Reasoning / thinking */}
+              {(part.type === 'reasoning' || part.type === 'thinking') && (part.text || part.thinking) && (() => {
+                const thinkingText = part.text || part.thinking || '';
+                const partKey = part.id || `reasoning-${i}`;
+                const isExpanded = getPartExpanded(partKey);
+                const isThinking = !isReasoningDone;
+                const partLabel = isThinking
+                  ? `💭 ${t('chat.thinking')}`
+                  : `💭 ${thinkingText.slice(0, 60)}${thinkingText.length > 60 ? '...' : ''}`;
+                return (
+                  <div className="mt-2">
+                    <button
+                      onClick={() => togglePart(partKey)}
+                      disabled={isThinking}
+                      className={`flex items-center gap-1.5 px-2 py-1 rounded-md border text-xs font-medium transition-colors w-full text-left
+                        ${isThinking
+                          ? 'bg-purple-50 border-purple-200 text-purple-700 cursor-default'
+                          : 'bg-purple-50 hover:bg-purple-100 border-purple-200 text-purple-900 cursor-pointer'
+                        }`}
+                    >
+                      {isThinking && (
+                        <span className="flex gap-0.5 mr-1">
+                          <span className="w-1 h-1 bg-purple-400 rounded-full animate-bounce" style={{ animationDelay: '0ms' }} />
+                          <span className="w-1 h-1 bg-purple-400 rounded-full animate-bounce" style={{ animationDelay: '150ms' }} />
+                          <span className="w-1 h-1 bg-purple-400 rounded-full animate-bounce" style={{ animationDelay: '300ms' }} />
+                        </span>
+                      )}
+                      {partLabel}
+                      {!isThinking && (
+                        <ChevronDown
+                          className={`w-3 h-3 ml-auto text-purple-600 transition-transform ${isExpanded ? '' : '-rotate-90'}`}
+                        />
+                      )}
+                    </button>
+                    {isExpanded && (
+                      <div className="mt-1 p-2 bg-purple-50/50 rounded-md border border-purple-100 text-xs text-purple-800 whitespace-pre-wrap font-mono leading-relaxed">
+                        {thinkingText}
+                      </div>
+                    )}
+                  </div>
+                );
+              })()}
+            </div>
+          ))
+        )}
 
         {/* Streaming indicator */}
         {isActive && !isUser && parts.length > 0 && (() => {
@@ -1194,24 +1719,83 @@ function ChatMessageBubbleInner({
           );
         })()}
 
-        {/* Actions (copy) — for assistant messages */}
-        {showActions && !isUser && parts.length > 0 && (
-          <div className="flex items-center gap-2 mt-3 pt-3 border-t border-gray-100 opacity-0 group-hover:opacity-100 transition-opacity duration-200">
-            <button
-              onClick={() => onCopy?.(getTextContent())}
-              className="flex items-center gap-1 px-2 py-1 text-xs text-gray-600 hover:text-gray-900 hover:bg-gray-100 rounded-md transition-colors"
-              title={t('chat.copyTitle')}
-            >
-              <Copy className="w-3.5 h-3.5" />
-              <span>{t('chat.copy')}</span>
-            </button>
-          </div>
-        )}
-
         {/* Timestamp */}
         {showTimestamp && message.timestamp && (
           <div className={`text-xs mt-2 ${isUser ? 'opacity-60' : 'opacity-40'}`}>
             {formatSmartTime(message.timestamp)}
+          </div>
+        )}
+
+        {/* Actions */}
+        {showActions && parts.length > 0 && (
+          <div className={actionBarClass}>
+            {isEditing ? (
+              <>
+                <button
+                  onClick={() => void onEditSave?.()}
+                  disabled={actionsDisabled || isActionPending || !editingText.trim()}
+                  className={iconButtonClass}
+                  aria-label={t('chat.save')}
+                >
+                  <Save className="w-3 h-3" />
+                  <span className={tooltipClass}>{t('chat.save')}</span>
+                </button>
+                {isUser && (
+                  <button
+                    onClick={() => void onEditSend?.()}
+                    disabled={actionsDisabled || isActionPending || !editingText.trim()}
+                    className={iconButtonClass}
+                    aria-label={t('chat.sendEdited')}
+                  >
+                    <Send className="w-3 h-3" />
+                    <span className={tooltipClass}>{t('chat.sendEdited')}</span>
+                  </button>
+                )}
+                <button
+                  onClick={onEditCancel}
+                  disabled={isActionPending}
+                  className={iconButtonClass}
+                  aria-label={t('chat.cancel')}
+                >
+                  <X className="w-3 h-3" />
+                  <span className={tooltipClass}>{t('chat.cancel')}</span>
+                </button>
+              </>
+            ) : (
+              <>
+                {targetPartId && editableRawText && (
+                  <button
+                    onClick={() => onEditStart?.(targetMessageId, targetPartId, message.role, editableRawText)}
+                    disabled={actionsDisabled || isActionPending}
+                    className={iconButtonClass}
+                    aria-label={isUser ? t('chat.edit') : t('chat.editRawTitle')}
+                  >
+                    <Pencil className="w-3 h-3" />
+                    <span className={tooltipClass}>{isUser ? t('chat.edit') : t('chat.editRawTitle')}</span>
+                  </button>
+                )}
+                <button
+                  onClick={() => onCopy?.(getTextContent())}
+                  disabled={isActionPending}
+                  className={iconButtonClass}
+                  aria-label={t('chat.copy')}
+                >
+                  <Copy className="w-3 h-3" />
+                  <span className={tooltipClass}>{t('chat.copy')}</span>
+                </button>
+                {!isUser && (
+                  <button
+                    onClick={() => void onRegenerate?.(targetMessageId)}
+                    disabled={actionsDisabled || isActionPending}
+                    className={iconButtonClass}
+                    aria-label={t('chat.regenerate')}
+                  >
+                    <RefreshCw className={`w-3 h-3 ${isActionPending ? 'animate-spin' : ''}`} />
+                    <span className={tooltipClass}>{t('chat.regenerate')}</span>
+                  </button>
+                )}
+              </>
+            )}
           </div>
         )}
       </div>
@@ -1347,6 +1931,10 @@ export function ChatToolPart({ part, pendingQuestion, onAnswer, onReject }: Chat
 export const ChatMessageBubble = memo(ChatMessageBubbleInner, (prev, next) => {
   if (prev.isActive !== next.isActive) return false;
   if (prev.showActions !== next.showActions) return false;
+  if (prev.editingMessageId !== next.editingMessageId) return false;
+  if (prev.editingText !== next.editingText) return false;
+  if (prev.actionsDisabled !== next.actionsDisabled) return false;
+  if (prev.actionMessageId !== next.actionMessageId) return false;
   if (prev.message.finish !== next.message.finish) return false;
   const prevParts = prev.message.parts as any[] | undefined;
   const nextParts = next.message.parts as any[] | undefined;
@@ -1358,6 +1946,8 @@ export const ChatMessageBubble = memo(ChatMessageBubbleInner, (prev, next) => {
   return (
     prevLast?.text === nextLast?.text &&
     prevLast?.thinking === nextLast?.thinking &&
-    prevLast?.state?.status === nextLast?.state?.status
+    prevLast?.state?.status === nextLast?.state?.status &&
+    JSON.stringify(prevLast?.state?.metadata) ===
+      JSON.stringify(nextLast?.state?.metadata)
   );
 });

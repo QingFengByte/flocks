@@ -10,7 +10,7 @@ Supports any API that implements OpenAI's chat completions API, including:
 """
 
 import asyncio
-from typing import List, AsyncIterator, Optional, Any
+from typing import Dict, List, AsyncIterator, Optional, Any
 import os
 
 from flocks.provider.provider import (
@@ -21,7 +21,13 @@ from flocks.provider.provider import (
     ChatResponse,
     StreamChunk,
 )
-from flocks.provider.sdk.openai_base import extract_reasoning_content, ThinkTagExtractor
+from flocks.provider.sdk.openai_base import (
+    ThinkTagExtractor,
+    _normalize_stream_usage,
+    _supports_include_usage_fallback,
+    extract_reasoning_content,
+    resolve_verify_ssl,
+)
 from flocks.utils.log import Log
 
 log = Log.create(service="provider.openai_compatible")
@@ -47,6 +53,7 @@ class OpenAICompatibleProvider(BaseProvider):
         if self._client is None:
             try:
                 from openai import AsyncOpenAI
+                import httpx
                 
                 # Get API key (many local services don't need one)
                 api_key = self._config.api_key if self._config else self._api_key
@@ -62,13 +69,21 @@ class OpenAICompatibleProvider(BaseProvider):
                 
                 if not base_url:
                     raise ValueError("OpenAI Compatible base URL not configured. Set OPENAI_COMPATIBLE_BASE_URL environment variable.")
-                
+
+                custom_settings = getattr(self._config, "custom_settings", None) or {}
+                verify_ssl = resolve_verify_ssl(custom_settings, default=True)
+                http_client = httpx.AsyncClient(verify=verify_ssl, timeout=120.0)
+
                 # Create client
                 self._client = AsyncOpenAI(
                     api_key=api_key,
                     base_url=base_url,
+                    http_client=http_client,
                 )
-                self.log.info("openai_compatible.client.created", {"base_url": base_url})
+                self.log.info(
+                    "openai_compatible.client.created",
+                    {"base_url": base_url, "verify_ssl": verify_ssl},
+                )
                     
             except ImportError:
                 raise ImportError("openai package not installed. Install with: pip install openai")
@@ -229,6 +244,7 @@ class OpenAICompatibleProvider(BaseProvider):
             "model": model_id,
             "messages": formatted_messages,
             "stream": True,
+            "stream_options": {"include_usage": True},
         }
 
         if thinking:
@@ -252,19 +268,37 @@ class OpenAICompatibleProvider(BaseProvider):
             "thinking_enabled": bool(thinking),
             "has_tools": bool(tools),
             "max_tokens": max_tokens,
+            "include_usage": True,
         })
 
-        stream = await client.chat.completions.create(**request_params)
+        try:
+            stream = await client.chat.completions.create(**request_params)
+        except Exception as exc:
+            if not _supports_include_usage_fallback(exc):
+                raise
+            self.log.warn("openai_compatible.stream.include_usage_unsupported", {
+                "model": model_id,
+                "error": str(exc),
+            })
+            request_params = dict(request_params)
+            request_params.pop("stream_options", None)
+            stream = await client.chat.completions.create(**request_params)
 
         # Stateful extractor to separate <think>...</think> from content.
         think_extractor = ThinkTagExtractor()
         _first_delta_logged = False
         emitted_substantive_chunk = False
+        stream_usage: Optional[Dict[str, int]] = None
+        usage_emitted = False
 
         async for chunk in stream:
+            normalized_usage = _normalize_stream_usage(getattr(chunk, "usage", None))
+            if normalized_usage:
+                stream_usage = normalized_usage
             if chunk.choices:
                 choice = chunk.choices[0]
                 delta = choice.delta
+                yielded_finish_for_this_chunk = False
 
                 if delta is not None:
                     if not _first_delta_logged:
@@ -313,7 +347,7 @@ class OpenAICompatibleProvider(BaseProvider):
                                     emitted_substantive_chunk = True
                                 yield StreamChunk(
                                     delta=seg_text,
-                                    finish_reason=choice.finish_reason,
+                                    finish_reason=None,
                                 )
 
                 # Flush think extractor on finish (before tool-call chunks; matches prior behavior)
@@ -360,11 +394,29 @@ class OpenAICompatibleProvider(BaseProvider):
                             tool_calls.append(tc_dict)
 
                         if tool_calls:
-                            yield StreamChunk(
+                            terminal_chunk = StreamChunk(
                                 delta="",  # Empty string, not None
                                 finish_reason=choice.finish_reason,
                                 tool_calls=tool_calls,
+                                usage=stream_usage,
                             )
+                            yield terminal_chunk
+                            usage_emitted = usage_emitted or terminal_chunk.usage is not None
+                            yielded_finish_for_this_chunk = True
+
+                if choice.finish_reason and not yielded_finish_for_this_chunk:
+                    terminal_chunk = StreamChunk(
+                        delta="",
+                        finish_reason=choice.finish_reason,
+                        usage=stream_usage,
+                    )
+                    yield terminal_chunk
+                    usage_emitted = usage_emitted or terminal_chunk.usage is not None
+
+        # Some routers emit the OpenAI usage-only frame after the finish chunk.
+        # Re-emit that trailing usage so downstream stats persistence sees it.
+        if emitted_substantive_chunk and stream_usage and not usage_emitted:
+            yield StreamChunk(delta="", finish_reason=None, usage=stream_usage)
 
         if not emitted_substantive_chunk:
             self.log.warn("openai_compatible.stream.empty_response", {
@@ -416,6 +468,7 @@ class OpenAICompatibleProvider(BaseProvider):
                     yield StreamChunk(
                         delta=fallback_content,
                         finish_reason=fallback.finish_reason or "stop",
+                        usage=fallback.usage or None,
                     )
                     return
                 if minimax_empty_response_target:
@@ -479,6 +532,7 @@ class OpenAICompatibleProvider(BaseProvider):
                     yield StreamChunk(
                         delta=fallback_content,
                         finish_reason=fallback.finish_reason or "stop",
+                        usage=fallback.usage or None,
                     )
                     return
                 if minimax_empty_response_target:

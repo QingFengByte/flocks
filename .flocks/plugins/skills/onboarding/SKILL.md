@@ -458,9 +458,14 @@ ConfigWriter.update_config_section('channels.wecom', {
 
 ### 钉钉 (DingTalk)
 
-必填：**Client ID**、**Client Secret**。
+必填：**Client ID**（即 AppKey）、**Client Secret**（即 AppSecret）。
 
-请用户前往 [钉钉开放平台](https://open.dingtalk.com/) → 应用开发 → 企业内部应用，创建应用后在「基础信息」页面获取 Client ID 和 Client Secret。
+接入方式为钉钉 Stream 长连接，**不需要配置服务器域名或公网 IP**。
+
+获取步骤：
+1. 点击 <a href="/dingtalk-channel-guide.pdf" download="dingtalk-channel-guide.pdf">下载《钉钉配置指引》PDF</a>，按文档指引在钉钉开放平台创建应用并开启 Stream 模式
+2. 创建完成后，在应用详情页找到 **Client ID**（AppKey）和 **Client Secret**（AppSecret）
+3. 把 Client ID 和 Client Secret 告诉我
 
 ```python
 import json
@@ -478,7 +483,7 @@ ConfigWriter.update_config_section('channels.dingtalk', {
     'enabled': True,
     'defaultAgent': 'rex',
     'clientId': '<CLIENT_ID>',
-    'clientSecret': '{secret:channel_dingtalk_clientSecret}'
+    'clientSecret': '{secret:channel_dingtalk_clientSecret}',
 })
 ```
 

@@ -220,6 +220,7 @@ export interface APIServiceSummary {
   description?: string;
   description_cn?: string;
   builtin?: boolean;
+  verify_ssl: boolean;
 }
 
 export interface APIServiceCredentialField {
@@ -250,6 +251,7 @@ export interface APIServiceMetadata {
   base_url?: string;
   docs_url?: string;
   credential_schema?: APIServiceCredentialField[];
+  verify_ssl?: boolean;
 }
 
 export interface MCPServerConfig {
@@ -478,10 +480,33 @@ export interface UsageStats {
     total_cost: number;
     total_requests: number;
     currency: string;
+    cost_by_currency: { currency: string; total_cost: number }[];
   };
-  by_provider: { provider_id: string; total_tokens: number; total_cost: number; request_count: number }[];
-  by_model: { provider_id: string; model_id: string; total_tokens: number; total_cost: number; request_count: number }[];
-  daily: { date: string; total_tokens: number; total_cost: number; request_count: number }[];
+  by_provider: {
+    provider_id: string;
+    total_tokens: number;
+    total_cost: number;
+    request_count: number;
+    currency: string;
+    cost_by_currency: { currency: string; total_cost: number }[];
+  }[];
+  by_model: {
+    provider_id: string;
+    model_id: string;
+    total_tokens: number;
+    total_cost: number;
+    request_count: number;
+    currency: string;
+    cost_by_currency: { currency: string; total_cost: number }[];
+  }[];
+  daily: {
+    date: string;
+    total_tokens: number;
+    total_cost: number;
+    request_count: number;
+    currency: string;
+    cost_by_currency: { currency: string; total_cost: number }[];
+  }[];
 }
 
 /** Custom provider creation */

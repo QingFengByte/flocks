@@ -8,8 +8,11 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
 import shutil
+import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional, Any, Dict, Literal
 from fastapi import APIRouter, HTTPException, status, Query
@@ -27,23 +30,42 @@ from flocks.workflow.center import (
     list_registry_entries,
     list_workflow_releases,
     publish_workflow,
-    resolve_global_workflow_roots,
-    resolve_project_workflow_roots,
     scan_skill_workflows,
     stop_workflow_service,
 )
 from flocks.session.recorder import Recorder
+from flocks.session.message import Message, MessageRole
+from flocks.session.session import Session
 from flocks.workflow.workflow_lint import lint_workflow
 from flocks.workflow.compiler import compile_workflow
+from flocks.workflow.fs_store import (
+    find_workspace_root as _find_workspace_root,
+    read_workflow_dir as _read_workflow_dir,
+    read_workflow_from_fs as shared_read_workflow_from_fs,
+    workflow_scan_dirs as _all_scan_dirs,
+)
 from flocks.workflow.io import load_workflow, dump_workflow
+from flocks.workflow.tools import get_tool_registry
 from flocks.config.config import Config
 from flocks.storage.storage import Storage
 from flocks.server.routes.event import publish_event
+from flocks.tool import ToolContext
 from flocks.utils.log import Log
 
 
 router = APIRouter()
 log = Log.create(service="workflow-routes")
+
+
+@dataclass
+class ActiveWorkflowExecution:
+    """Tracks an in-flight workflow execution that can be cancelled."""
+    workflow_id: str
+    task: asyncio.Task[Any]
+    cancel_event: threading.Event
+
+
+_active_workflow_executions: Dict[str, ActiveWorkflowExecution] = {}
 
 
 # =============================================================================
@@ -97,6 +119,9 @@ class WorkflowRunRequest(BaseModel):
     inputs: Optional[Dict[str, Any]] = Field(default_factory=dict, description="Input parameters")
     timeout_s: Optional[float] = Field(None, alias="timeoutS", description="Timeout in seconds")
     trace: bool = Field(False, description="Enable tracing")
+    session_id: Optional[str] = Field(None, alias="sessionId", description="Optional parent session ID")
+    message_id: Optional[str] = Field(None, alias="messageId", description="Optional parent message ID")
+    agent: Optional[str] = Field(None, description="Optional agent name for tool context")
 
 
 class WorkflowExecutionResponse(BaseModel):
@@ -107,7 +132,7 @@ class WorkflowExecutionResponse(BaseModel):
     workflowId: str = Field(..., description="Workflow ID")
     inputParams: Dict[str, Any] = Field(default_factory=dict, description="Input parameters")
     outputResults: Optional[Dict[str, Any]] = Field(None, description="Output results")
-    status: str = Field(..., description="Status: running/success/error/timeout")
+    status: str = Field(..., description="Status: running/success/error/timeout/cancelled")
     startedAt: int = Field(..., description="Start timestamp (ms)")
     finishedAt: Optional[int] = Field(None, description="Finish timestamp (ms)")
     duration: Optional[float] = Field(None, description="Duration (seconds)")
@@ -148,26 +173,6 @@ class WorkflowStatsResponse(BaseModel):
 # Filesystem Helpers (Single Source of Truth)
 # =============================================================================
 
-_workspace_root: Optional[Path] = None
-
-
-def _find_workspace_root() -> Path:
-    """Walk up from cwd until a directory containing .flocks/ is found.
-
-    The result is cached for the lifetime of the process since the workspace
-    root does not change at runtime.
-    """
-    global _workspace_root
-    if _workspace_root is not None:
-        return _workspace_root
-    current = Path.cwd()
-    for candidate in [current, *current.parents]:
-        if (candidate / ".flocks").is_dir():
-            _workspace_root = candidate
-            return candidate
-    _workspace_root = current
-    return current
-
 
 def _workflow_dir(workflow_id: str) -> Path:
     """Return the project-level directory for a workflow."""
@@ -179,64 +184,6 @@ def _global_workflow_dir(workflow_id: str) -> Path:
     return Path.home() / ".flocks" / "plugins" / "workflows" / workflow_id
 
 
-def _all_scan_dirs() -> List[tuple[Path, str]]:
-    """Return all workflow scan directories with their source labels.
-
-    Ordered from lowest to highest priority so that later entries
-    override earlier ones when the same workflow ID appears.
-    """
-    workspace = _find_workspace_root()
-    return [
-        (root, "global") for root in resolve_global_workflow_roots()
-    ] + [
-        (root, "project") for root in resolve_project_workflow_roots(workspace)
-    ]
-
-
-def _read_workflow_dir(wf_dir: Path, workflow_id: str, source: str) -> Optional[Dict[str, Any]]:
-    """Read a single workflow directory and return its data dict, or None."""
-    json_file = wf_dir / "workflow.json"
-    if not json_file.is_file():
-        return None
-
-    try:
-        with open(json_file, "r", encoding="utf-8") as f:
-            workflow_json = json.load(f)
-
-        meta_file = wf_dir / "meta.json"
-        if meta_file.is_file():
-            with open(meta_file, "r", encoding="utf-8") as f:
-                meta = json.load(f)
-        else:
-            mtime_ms = int(json_file.stat().st_mtime * 1000)
-            meta = {
-                "name": workflow_json.get("name", workflow_id),
-                "description": workflow_json.get("description"),
-                "category": workflow_json.get("category", "default"),
-                "status": "active",
-                "createdBy": None,
-                "createdAt": mtime_ms,
-                "updatedAt": mtime_ms,
-            }
-
-        md_file = wf_dir / "workflow.md"
-        markdown_content: Optional[str] = None
-        if md_file.is_file():
-            with open(md_file, "r", encoding="utf-8") as f:
-                markdown_content = f.read()
-
-        return {
-            **meta,
-            "id": workflow_id,
-            "source": source,
-            "workflowJson": workflow_json,
-            "markdownContent": markdown_content,
-        }
-    except Exception as exc:
-        log.warning("workflow.fs.read.failed", {"id": workflow_id, "source": source, "error": str(exc)})
-        return None
-
-
 def _read_workflow_from_fs(workflow_id: str) -> Optional[Dict[str, Any]]:
     """Read workflow data from the filesystem.
 
@@ -244,16 +191,88 @@ def _read_workflow_from_fs(workflow_id: str) -> Optional[Dict[str, Any]]:
     resolve_global_workflow_roots / resolve_project_workflow_roots; per-id dir
     is ``<root>/<id>/`` with ``workflow.json`` inside.
     """
-    candidates = [
-        (root / workflow_id, source)
-        for root, source in _all_scan_dirs()
-    ]
-    result = None
-    for wf_dir, source in candidates:
-        data = _read_workflow_dir(wf_dir, workflow_id, source)
-        if data is not None:
-            result = data
-    return result
+    return shared_read_workflow_from_fs(workflow_id)
+
+
+async def _build_workflow_tool_context(
+    *,
+    workflow_id: str,
+    action_name: str,
+    session_id: Optional[str] = None,
+    message_id: Optional[str] = None,
+    agent: Optional[str] = None,
+) -> ToolContext:
+    """Build a real ToolContext for workflow execution.
+
+    Prefer the caller-provided session/message. When absent, create a temporary
+    parent session and synthetic user message so workflow-internal tools such as
+    `task` can resolve a valid parent session.
+    """
+    effective_session_id = str(session_id or "").strip()
+    effective_message_id = str(message_id or "").strip()
+    effective_agent = str(agent or "").strip()
+
+    workspace_dir = os.getcwd()
+    project_id = "default"
+    try:
+        from flocks.project.instance import Instance
+
+        workspace_dir = str(getattr(Instance, "directory", None) or workspace_dir)
+        project = getattr(Instance, "project", None)
+        if project is not None and getattr(project, "id", None):
+            project_id = str(project.id)
+    except Exception:
+        workspace_dir = str(_find_workspace_root())
+
+    parent_session = None
+    if effective_session_id:
+        parent_session = await Session.get_by_id(effective_session_id)
+        if not parent_session:
+            raise HTTPException(status_code=400, detail=f"Parent session not found: {effective_session_id}")
+        workspace_dir = str(getattr(parent_session, "directory", None) or workspace_dir)
+        if getattr(parent_session, "project_id", None):
+            project_id = str(parent_session.project_id)
+        if not effective_agent:
+            effective_agent = str(getattr(parent_session, "agent", None) or "rex")
+    else:
+        parent_session = await Session.create(
+            project_id=project_id,
+            directory=workspace_dir,
+            title=f"Workflow {action_name}: {workflow_id}",
+            agent=effective_agent or "rex",
+            category="task",
+            metadata={
+                "workflowTempParent": True,
+                "hideFromSessionManager": True,
+                "workflowId": workflow_id,
+                "workflowAction": action_name,
+            },
+        )
+        effective_session_id = parent_session.id
+        workspace_dir = str(getattr(parent_session, "directory", None) or workspace_dir)
+        if not effective_agent:
+            effective_agent = str(getattr(parent_session, "agent", None) or "rex")
+
+    if not effective_message_id:
+        message = await Message.create(
+            session_id=effective_session_id,
+            role=MessageRole.USER,
+            content=f"[Workflow {action_name}] {workflow_id}",
+            agent=effective_agent or "rex",
+            synthetic=True,
+        )
+        effective_message_id = message.id
+
+    return ToolContext(
+        session_id=effective_session_id,
+        message_id=effective_message_id,
+        agent=effective_agent or "rex",
+        event_publish_callback=publish_event,
+        extra={
+            "workspace_dir": workspace_dir,
+            "main_session_key": effective_session_id,
+        },
+    )
 
 
 def _write_workflow_to_fs(
@@ -401,6 +420,149 @@ def _workflow_stats_key(workflow_id: str) -> str:
 
 def _workflow_execution_key(exec_id: str) -> str:
     return f"workflow_execution/{exec_id}"
+
+
+def _normalize_execution_status(status: str) -> str:
+    """Map runner status values to API status values."""
+    normalized = (status or "").strip().upper()
+    if normalized == "SUCCEEDED":
+        return "success"
+    if normalized == "FAILED":
+        return "error"
+    if normalized == "TIMED_OUT":
+        return "timeout"
+    if normalized == "CANCELLED":
+        return "cancelled"
+    return (status or "error").strip().lower() or "error"
+
+
+def _extract_business_failure_message(outputs: Dict[str, Any]) -> Optional[str]:
+    """Return a user-facing failure reason from workflow outputs."""
+    for key in ("reason", "error_message", "errorMessage", "message"):
+        value = outputs.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _resolve_execution_outcome(result: RunWorkflowResult) -> tuple[str, Optional[str]]:
+    """Resolve API execution status from runner status and workflow outputs."""
+    status_value = _normalize_execution_status(result.status)
+    error_message = result.error
+
+    if status_value != "success" or not isinstance(result.outputs, dict):
+        return status_value, error_message
+
+    if result.outputs.get("workflow_success") is False:
+        return (
+            "error",
+            error_message
+            or _extract_business_failure_message(result.outputs)
+            or "Workflow reported business failure.",
+        )
+
+    return status_value, error_message
+
+
+async def _record_execution_result(workflow_id: str, exec_id: str, exec_data: Dict[str, Any]) -> None:
+    """Persist the final execution record and audit trail."""
+    await Storage.write(_workflow_execution_key(exec_id), exec_data)
+    try:
+        await Recorder.record_workflow_execution(
+            exec_id=exec_id,
+            workflow_id=workflow_id,
+            run_result=exec_data,
+        )
+    except Exception:
+        pass
+
+
+async def _run_workflow_execution_task(
+    *,
+    workflow_id: str,
+    workflow_json: Dict[str, Any],
+    req: WorkflowRunRequest,
+    exec_id: str,
+    cancel_event: threading.Event,
+    tool_context: Optional[ToolContext] = None,
+) -> None:
+    """Execute a workflow in the background and keep the execution record updated."""
+    exec_key = _workflow_execution_key(exec_id)
+    start_time = time.time()
+    step_history: list[dict[str, Any]] = []
+    loop = asyncio.get_running_loop()
+    def _on_step_complete(step_result) -> None:
+        step_dict = step_result.model_dump(mode="json")
+        step_history.append(step_dict)
+        try:
+            current = asyncio.run_coroutine_threadsafe(Storage.read(exec_key), loop).result(timeout=5)
+            update = {
+                **current,
+                "executionLog": list(step_history),
+            }
+            asyncio.run_coroutine_threadsafe(Storage.write(exec_key, update), loop).result(timeout=5)
+        except Exception as exc:
+            log.warning("workflow.step_progress.write_failed", {
+                "exec_id": exec_id,
+                "error": str(exc),
+            })
+
+    try:
+        result: RunWorkflowResult = await asyncio.to_thread(
+            run_workflow,
+            workflow=workflow_json,
+            inputs=req.inputs or {},
+            timeout_s=req.timeout_s,
+            trace=req.trace,
+            on_step_complete=_on_step_complete,
+            cancel=cancel_event.is_set,
+            tool_context=tool_context,
+        )
+
+        duration = time.time() - start_time
+        current_data = await Storage.read(exec_key)
+        status_value, error_message = _resolve_execution_outcome(result)
+        current_data.update({
+            "outputResults": result.outputs,
+            "status": status_value,
+            "finishedAt": int(time.time() * 1000),
+            "duration": duration,
+            "executionLog": result.history or list(step_history),
+            "errorMessage": error_message,
+        })
+
+        if status_value == "success":
+            await _update_workflow_stats(workflow_id, True, duration)
+        elif status_value in {"error", "timeout"}:
+            await _update_workflow_stats(workflow_id, False, duration)
+
+        await _record_execution_result(workflow_id, exec_id, current_data)
+        log.info("workflow.executed", {
+            "id": workflow_id,
+            "exec_id": exec_id,
+            "status": status_value,
+            "duration": duration,
+        })
+    except Exception as exc:
+        duration = time.time() - start_time
+        current_data = await Storage.read(exec_key)
+        current_data.update({
+            "status": "cancelled" if cancel_event.is_set() else "error",
+            "finishedAt": int(time.time() * 1000),
+            "duration": duration,
+            "errorMessage": str(exc),
+            "executionLog": list(step_history),
+        })
+        if current_data["status"] == "error":
+            await _update_workflow_stats(workflow_id, False, duration)
+        await _record_execution_result(workflow_id, exec_id, current_data)
+        log.error("workflow.execute.error", {
+            "id": workflow_id,
+            "exec_id": exec_id,
+            "error": str(exc),
+        })
+    finally:
+        _active_workflow_executions.pop(exec_id, None)
 
 
 _DEFAULT_STATS: Dict[str, Any] = {
@@ -673,6 +835,13 @@ async def run_workflow_endpoint(workflow_id: str, req: WorkflowRunRequest):
             raise HTTPException(status_code=404, detail=f"Workflow not found: {workflow_id}")
 
         workflow_json = data["workflowJson"]
+        tool_context = await _build_workflow_tool_context(
+            workflow_id=workflow_id,
+            action_name="run",
+            session_id=req.session_id,
+            message_id=req.message_id,
+            agent=req.agent,
+        )
 
         # Create execution record
         exec_id = str(uuid.uuid4())
@@ -690,93 +859,75 @@ async def run_workflow_endpoint(workflow_id: str, req: WorkflowRunRequest):
         # Save initial execution record
         await Storage.write(_workflow_execution_key(exec_id), exec_data)
         
-        # Run workflow with real-time step progress updates
-        start_time = time.time()
-        _step_history: list[dict] = []
-        _exec_key = _workflow_execution_key(exec_id)
-        _loop = asyncio.get_running_loop()
-
-        def _on_step_complete(step_result) -> None:
-            step_dict = step_result.model_dump(mode="json")
-            _step_history.append(step_dict)
-            try:
-                update = {
-                    **exec_data,
-                    "executionLog": list(_step_history),
-                }
-                future = asyncio.run_coroutine_threadsafe(
-                    Storage.write(_exec_key, update), _loop
-                )
-                future.result(timeout=5)
-            except Exception as _exc:
-                log.warning("workflow.step_progress.write_failed", {
-                    "exec_id": exec_id, "error": str(_exc),
-                })
-
-        try:
-            result: RunWorkflowResult = await asyncio.to_thread(
-                run_workflow,
-                workflow=workflow_json,
-                inputs=req.inputs or {},
-                timeout_s=req.timeout_s,
-                trace=req.trace,
-                on_step_complete=_on_step_complete,
-            )
-            
-            duration = time.time() - start_time
-            _status = "success" if result.status == "SUCCEEDED" else (
-                "error" if result.status == "FAILED" else result.status
-            )
-            success = _status == "success"
-            
-            exec_data.update({
-                "outputResults": result.outputs,
-                "status": _status,
-                "finishedAt": int(time.time() * 1000),
-                "duration": duration,
-                "executionLog": result.history,
-                "errorMessage": result.error,
-            })
-            
-            await _update_workflow_stats(workflow_id, success, duration)
-            
-            log.info("workflow.executed", {
-                "id": workflow_id,
-                "exec_id": exec_id,
-                "status": _status,
-                "duration": duration,
-            })
-        except Exception as e:
-            duration = time.time() - start_time
-            exec_data.update({
-                "status": "error",
-                "finishedAt": int(time.time() * 1000),
-                "duration": duration,
-                "errorMessage": str(e),
-                "executionLog": _step_history,
-            })
-            await _update_workflow_stats(workflow_id, False, duration)
-            log.error("workflow.execute.error", {"id": workflow_id, "error": str(e)})
-        
-        # Save final execution record
-        await Storage.write(_workflow_execution_key(exec_id), exec_data)
-
-        # Append-only execution recording for audit/replay
-        try:
-            await Recorder.record_workflow_execution(
-                exec_id=exec_id,
+        cancel_event = threading.Event()
+        task = asyncio.create_task(
+            _run_workflow_execution_task(
                 workflow_id=workflow_id,
-                run_result=exec_data,
+                workflow_json=workflow_json,
+                req=req,
+                exec_id=exec_id,
+                cancel_event=cancel_event,
+                tool_context=tool_context,
             )
-        except Exception:
-            pass
-        
+        )
+        _active_workflow_executions[exec_id] = ActiveWorkflowExecution(
+            workflow_id=workflow_id,
+            task=task,
+            cancel_event=cancel_event,
+        )
+
+        log.info("workflow.execution.started", {
+            "id": workflow_id,
+            "exec_id": exec_id,
+        })
         return WorkflowExecutionResponse(**exec_data)
     except HTTPException:
         raise
     except Exception as e:
         log.error("workflow.run.error", {"id": workflow_id, "error": str(e)})
         raise HTTPException(status_code=500, detail=f"Failed to run workflow: {str(e)}")
+
+
+@router.post("/workflow/{workflow_id}/history/{exec_id}/cancel")
+async def cancel_workflow_execution(workflow_id: str, exec_id: str):
+    """Request cooperative cancellation of a running workflow execution."""
+    try:
+        exec_data = await Storage.read(_workflow_execution_key(exec_id))
+        if exec_data.get("workflowId") != workflow_id:
+            raise HTTPException(status_code=404, detail="Execution not found for this workflow")
+
+        active = _active_workflow_executions.get(exec_id)
+        if active is None:
+            return {
+                "status": "ignored",
+                "message": f"Execution {exec_id} is already {exec_data.get('status', 'completed')}",
+                "executionId": exec_id,
+            }
+
+        if active.workflow_id != workflow_id:
+            raise HTTPException(status_code=404, detail="Execution not found for this workflow")
+
+        active.cancel_event.set()
+        log.info("workflow.execution.cancel_requested", {
+            "id": workflow_id,
+            "exec_id": exec_id,
+        })
+        return {
+            "status": "accepted",
+            "message": f"Cancellation requested for execution {exec_id}",
+            "executionId": exec_id,
+        }
+    except Storage.NotFoundError:
+        raise HTTPException(status_code=404, detail=f"Execution not found: {exec_id}")
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.error("workflow.execution.cancel.error", {
+            "id": workflow_id,
+            "exec_id": exec_id,
+            "error": str(e),
+        })
+        raise HTTPException(status_code=500, detail=f"Failed to cancel execution: {str(e)}")
 
 
 @router.post("/workflow/{workflow_id}/validate")
@@ -1381,6 +1532,9 @@ class RunNodeRequest(BaseModel):
 
     node_id: str = Field(..., description="Node ID to execute")
     inputs: Dict[str, Any] = Field(default_factory=dict, description="Input data for the node")
+    session_id: Optional[str] = Field(None, alias="sessionId", description="Optional parent session ID")
+    message_id: Optional[str] = Field(None, alias="messageId", description="Optional parent message ID")
+    agent: Optional[str] = Field(None, description="Optional agent name for tool context")
 
 
 class RunNodeResponse(BaseModel):
@@ -1410,6 +1564,13 @@ async def run_single_node(workflow_id: str, req: RunNodeRequest):
             raise HTTPException(status_code=404, detail=f"Workflow not found: {workflow_id}")
 
         workflow_json = data["workflowJson"]
+        tool_context = await _build_workflow_tool_context(
+            workflow_id=workflow_id,
+            action_name=f"run-node:{req.node_id}",
+            session_id=req.session_id,
+            message_id=req.message_id,
+            agent=req.agent,
+        )
 
         try:
             from flocks.workflow.models import Workflow as WfModel
@@ -1417,7 +1578,10 @@ async def run_single_node(workflow_id: str, req: RunNodeRequest):
             from flocks.workflow.repl_runtime import PythonExecRuntime
 
             wf = WfModel.from_dict(workflow_json)
-            engine = WorkflowEngine(wf, runtime=PythonExecRuntime())
+            engine = WorkflowEngine(
+                wf,
+                runtime=PythonExecRuntime(tool_registry=get_tool_registry(tool_context=tool_context)),
+            )
 
             step_result = await asyncio.to_thread(engine.run_node, req.node_id, req.inputs)
 
