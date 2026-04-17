@@ -245,62 +245,9 @@ def resolve_flocks_cli_command(root: Path | None = None) -> list[str]:
     return resolve_python_subprocess_command(root) + ["-m", "flocks.cli.main"]
 
 
-def _bundled_node_install_dir() -> Path | None:
-    """Directory containing Windows node.exe / Unix bin/node when using bundled or installer layout."""
-    explicit = os.environ.get("FLOCKS_NODE_HOME")
-    if explicit:
-        p = Path(explicit).expanduser().resolve()
-        if sys.platform == "win32" and (p / "node.exe").is_file():
-            return p
-        if sys.platform != "win32":
-            if (p / "bin" / "node").is_file():
-                return p
-            if p.name == "bin" and (p / "node").is_file():
-                return p.parent
-
-    install_root = os.environ.get("FLOCKS_INSTALL_ROOT")
-    if install_root:
-        base = Path(install_root).expanduser().resolve() / "tools" / "node"
-        if sys.platform == "win32" and (base / "node.exe").is_file():
-            return base
-        if sys.platform != "win32" and (base / "bin" / "node").is_file():
-            return base
-    return None
-
-
-def resolve_node_executable() -> str | None:
-    """Prefer FLOCKS_NODE_HOME / FLOCKS_INSTALL_ROOT bundled Node, then PATH."""
-    parent = _bundled_node_install_dir()
-    if parent is not None:
-        if sys.platform == "win32":
-            exe = parent / "node.exe"
-        else:
-            exe = parent / "bin" / "node"
-            if not exe.is_file():
-                exe = parent / "node"
-        if exe.is_file():
-            return str(exe)
-    return which("node")
-
-
-def resolve_npm_executable() -> str | None:
-    """Prefer npm next to bundled node (Windows npm.cmd), then PATH."""
-    parent = _bundled_node_install_dir()
-    if parent is not None and sys.platform == "win32":
-        for name in ("npm.cmd", "npm"):
-            candidate = parent / name
-            if candidate.is_file():
-                return str(candidate)
-    if parent is not None and sys.platform != "win32":
-        npm = parent / "bin" / "npm"
-        if npm.is_file():
-            return str(npm)
-    return which("npm") or which("npm.cmd")
-
-
 def get_node_major_version() -> int | None:
     """Return the detected Node.js major version."""
-    node = resolve_node_executable()
+    node = which("node")
     if not node:
         return None
 
@@ -757,11 +704,16 @@ def start_backend(config: ServiceConfig, console) -> None:
         str(config.backend_port),
     ]
 
+    backend_env = os.environ.copy()
+    backend_env["_FLOCKS_WEBUI_HOST"] = config.frontend_host
+    backend_env["_FLOCKS_WEBUI_PORT"] = str(config.frontend_port)
+
     console.print("[flocks] 启动后端服务...")
     process = _spawn_process(
         command,
         cwd=root,
         log_path=paths.backend_log,
+        env=backend_env,
     )
     write_runtime_record(
         paths.backend_pid,
@@ -833,7 +785,7 @@ def start_frontend(config: ServiceConfig, console) -> None:
     if runtime_record is not None:
         paths.frontend_pid.unlink(missing_ok=True)
 
-    npm = resolve_npm_executable()
+    npm = which("npm") or which("npm.cmd")
     if not npm:
         raise ServiceError("未检测到 npm，请先安装 Node.js 22+（包含 npm）后重试。")
     if not node_version_satisfies_requirement():
@@ -1098,15 +1050,42 @@ def _run_legacy_task_migration(root: Path, console) -> None:
             console.print("[flocks] 旧任务迁移失败，请检查日志。")
 
 
+def _resolve_stop_ports(
+    paths: RuntimePaths,
+    config: ServiceConfig | None = None,
+) -> tuple[int, int]:
+    """Resolve frontend/backend ports for stop flows.
+
+    When a runtime record is missing or uses the legacy pid-only format,
+    ``start`` and ``restart`` should fall back to the current CLI config
+    rather than the static default ports.
+    """
+    frontend_default = config.frontend_port if config is not None else ServiceConfig.frontend_port
+    backend_default = config.backend_port if config is not None else ServiceConfig.backend_port
+    return (
+        _effective_frontend_port(paths, frontend_default),
+        _recorded_port(paths.backend_pid, backend_default),
+    )
+
+
+def _stop_all_locked(
+    paths: RuntimePaths,
+    console,
+    *,
+    config: ServiceConfig | None = None,
+) -> None:
+    """Stop frontend then backend while reusing the caller's lock."""
+    fe_port, be_port = _resolve_stop_ports(paths, config)
+    _resolve_upgrade_runtime(console, frontend_port=fe_port, attempt_recover=False)
+    stop_one(fe_port, paths.frontend_pid, "WebUI", console)
+    stop_one(be_port, paths.backend_pid, "后端", console)
+
+
 def stop_all(console) -> None:
     """Stop frontend then backend using ports persisted in runtime records."""
     paths = ensure_runtime_dirs()
     with service_lock(paths):
-        fe_port = _effective_frontend_port(paths, ServiceConfig.frontend_port)
-        be_port = _recorded_port(paths.backend_pid, ServiceConfig.backend_port)
-        _resolve_upgrade_runtime(console, frontend_port=fe_port, attempt_recover=False)
-        stop_one(fe_port, paths.frontend_pid, "WebUI", console)
-        stop_one(be_port, paths.backend_pid, "后端", console)
+        _stop_all_locked(paths, console)
 
 
 def _start_all_without_stop(config: ServiceConfig, console) -> None:
@@ -1123,11 +1102,7 @@ def start_all(config: ServiceConfig, console) -> None:
     """Ensure backend and frontend are restarted with a clean state."""
     paths = ensure_runtime_dirs()
     with service_lock(paths):
-        fe_port = _effective_frontend_port(paths, config.frontend_port)
-        be_port = _recorded_port(paths.backend_pid, ServiceConfig.backend_port)
-        _resolve_upgrade_runtime(console, frontend_port=fe_port, attempt_recover=False)
-        stop_one(fe_port, paths.frontend_pid, "WebUI", console)
-        stop_one(be_port, paths.backend_pid, "后端", console)
+        _stop_all_locked(paths, console, config=config)
         _start_all_without_stop(config, console)
 
 
@@ -1135,11 +1110,7 @@ def restart_all(config: ServiceConfig, console) -> None:
     """Restart backend and frontend."""
     paths = ensure_runtime_dirs()
     with service_lock(paths):
-        fe_port = _effective_frontend_port(paths, config.frontend_port)
-        be_port = _recorded_port(paths.backend_pid, ServiceConfig.backend_port)
-        _resolve_upgrade_runtime(console, frontend_port=fe_port, attempt_recover=False)
-        stop_one(fe_port, paths.frontend_pid, "WebUI", console)
-        stop_one(be_port, paths.backend_pid, "后端", console)
+        _stop_all_locked(paths, console, config=config)
         _start_all_without_stop(config, console)
 
 

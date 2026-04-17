@@ -63,6 +63,10 @@
       "max_age_days": 3
     }
   },
+  "server": {
+    "cors": ["http://127.0.0.1:5173", "http://localhost:5173"]
+  },
+  "allowReadPaths": [],
   "updater": {
     "enabled": true,
     "repo": "AgentFlocks/flocks",
