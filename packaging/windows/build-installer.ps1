@@ -3,7 +3,8 @@
     [string]$RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path,
     [string]$ManifestPath = (Join-Path $PSScriptRoot "versions.manifest.json"),
     [string]$InnoSetupCompilerPath = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe",
-    [string]$CacheRoot = ""
+    [string]$CacheRoot = "",
+    [string]$AppVersion = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -32,7 +33,11 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 Write-Host "[build-installer] Compiling Inno Setup installer..."
-& $InnoSetupCompilerPath $installerScript ("/DStagingRoot=" + $OutputDir)
+$isccArgs = @($installerScript, ("/DStagingRoot=" + $OutputDir))
+if (-not [string]::IsNullOrWhiteSpace($AppVersion)) {
+    $isccArgs += "/DAppVersion=$AppVersion"
+}
+& $InnoSetupCompilerPath @isccArgs
 if ($LASTEXITCODE -ne 0) {
     throw "Inno Setup compilation failed with exit code $LASTEXITCODE"
 }

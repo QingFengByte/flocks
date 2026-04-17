@@ -242,27 +242,12 @@ function Refresh-Path {
     $machinePath = [System.Environment]::GetEnvironmentVariable("Path", "Machine")
     $env:Path = "$userPath;$machinePath"
 
-    $bundledUvBin = $null
-    $bundledNodeBin = $null
-    $installRoot = [Environment]::GetEnvironmentVariable("FLOCKS_INSTALL_ROOT")
-    if (-not [string]::IsNullOrWhiteSpace($installRoot)) {
-        $bundledUvCandidate = Join-Path $installRoot "tools\uv"
-        if (Test-Path (Join-Path $bundledUvCandidate "uv.exe")) {
-            $bundledUvBin = $bundledUvCandidate
-        }
-
-        $bundledNodeCandidate = Join-Path $installRoot "tools\node"
-        if (Test-Path (Join-Path $bundledNodeCandidate "npm.cmd")) {
-            $bundledNodeBin = $bundledNodeCandidate
-        }
-    }
-
     $uvBin = Join-Path $HOME ".local\bin"
     $cargoBin = Join-Path $HOME ".cargo\bin"
     $bunBin = Join-Path $HOME ".bun\bin"
     $windowsAppsBin = Join-Path $env:LOCALAPPDATA "Microsoft\WindowsApps"
 
-    foreach ($pathEntry in @($bundledUvBin, $bundledNodeBin, $uvBin, $cargoBin, $bunBin, $windowsAppsBin)) {
+    foreach ($pathEntry in @($uvBin, $cargoBin, $bunBin, $windowsAppsBin)) {
         Add-PathEntry $pathEntry
     }
 
@@ -876,13 +861,7 @@ function Invoke-InstallerCommandWithLockRetry {
 function Install-FlocksCli {
     Write-Info "Installing the global flocks CLI..."
 
-    $installRoot = [Environment]::GetEnvironmentVariable("FLOCKS_INSTALL_ROOT")
-    if ([string]::IsNullOrWhiteSpace($installRoot)) {
-        $linkDir = Join-Path $HOME ".local\bin"
-    }
-    else {
-        $linkDir = Join-Path $installRoot "bin"
-    }
+    $linkDir = Join-Path $HOME ".local\bin"
 
     if (Test-Command "uv") {
         $savedEA = $ErrorActionPreference
@@ -929,12 +908,7 @@ function Install-FlocksCli {
     }
 
     $wrapperPath = Join-Path $linkDir "flocks.cmd"
-    if ([string]::IsNullOrWhiteSpace($installRoot)) {
-        $wrapperContent = "@echo off`r`n`"$venvPython`" -m flocks.cli.main %*"
-    }
-    else {
-        $wrapperContent = "@echo off`r`nsetlocal`r`nif `"%FLOCKS_INSTALL_ROOT%`"==`"`" pushd `"%~dp0..`" >nul 2>&1`r`nif `"%FLOCKS_INSTALL_ROOT%`"==`"`" set `"FLOCKS_INSTALL_ROOT=%CD%`"`r`nif `"%FLOCKS_INSTALL_ROOT%`"==`"`" popd >nul 2>&1`r`nif `"%FLOCKS_REPO_ROOT%`"==`"`" set `"FLOCKS_REPO_ROOT=%FLOCKS_INSTALL_ROOT%\flocks`"`r`nif `"%FLOCKS_NODE_HOME%`"==`"`" set `"FLOCKS_NODE_HOME=%FLOCKS_INSTALL_ROOT%\tools\node`"`r`nset `"PATH=%FLOCKS_NODE_HOME%;%PATH%`"`r`npushd `"%FLOCKS_REPO_ROOT%`" >nul 2>&1`r`n`"%FLOCKS_INSTALL_ROOT%\flocks\.venv\Scripts\python.exe`" -m flocks.cli.main %*`r`nset `"FLOCKS_EXIT_CODE=%ERRORLEVEL%`"`r`npopd >nul 2>&1`r`nexit /b %FLOCKS_EXIT_CODE%"
-    }
+    $wrapperContent = "@echo off`r`n`"$venvPython`" -m flocks.cli.main %*"
     [System.IO.File]::WriteAllText($wrapperPath, $wrapperContent, [System.Text.Encoding]::Default)
 
     Ensure-UserPathEntry $linkDir
@@ -1020,36 +994,6 @@ function Resolve-ChromeForTestingPath {
     return $null
 }
 
-function Resolve-BundledChromePath {
-    $installRoot = [Environment]::GetEnvironmentVariable("FLOCKS_INSTALL_ROOT")
-    if ([string]::IsNullOrWhiteSpace($installRoot)) {
-        return $null
-    }
-
-    $installRoot = $installRoot.TrimEnd('\', '/')
-    $bundledChromeDir = Join-Path $installRoot "tools\chrome"
-    if (-not (Test-Path $bundledChromeDir)) {
-        return $null
-    }
-
-    $hintFile = Join-Path $bundledChromeDir "flocks-bundled-chrome.exe.relative.txt"
-    if (Test-Path $hintFile) {
-        try {
-            $relativeExePath = (Get-Content -Path $hintFile -Raw -ErrorAction Stop).Trim()
-            if (-not [string]::IsNullOrWhiteSpace($relativeExePath)) {
-                $candidatePath = Join-Path $installRoot $relativeExePath
-                if (Test-Path $candidatePath) {
-                    return (Resolve-Path $candidatePath).Path
-                }
-            }
-        }
-        catch {
-        }
-    }
-
-    return (Resolve-ChromeForTestingPath -BrowserDir $bundledChromeDir)
-}
-
 function Install-ChromeForTesting {
     $browserDir = Get-ChromeForTestingDir
 
@@ -1073,7 +1017,7 @@ function Install-ChromeForTesting {
     try {
         $process = Start-Process `
             -FilePath $npxPath `
-            -ArgumentList @("-y", "@puppeteer/browsers", "install", "chrome@stable", "--path", $browserDir) `
+            -ArgumentList @("--yes", "@puppeteer/browsers", "install", "chrome@stable", "--path", $browserDir) `
             -WorkingDirectory $browserDir `
             -NoNewWindow `
             -Wait `
@@ -1103,13 +1047,6 @@ function Install-ChromeForTesting {
 
 function Configure-AgentBrowserBrowser {
     $browserPath = Find-SystemBrowserPath
-
-    if ([string]::IsNullOrWhiteSpace($browserPath)) {
-        $browserPath = Resolve-BundledChromePath
-        if (-not [string]::IsNullOrWhiteSpace($browserPath)) {
-            Write-Info "Found bundled Chrome for Testing. agent-browser will use: $browserPath"
-        }
-    }
 
     if ([string]::IsNullOrWhiteSpace($browserPath)) {
         $browserPath = Resolve-ChromeForTestingPath -BrowserDir (Get-ChromeForTestingDir)

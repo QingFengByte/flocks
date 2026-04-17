@@ -27,12 +27,17 @@ jobs:
         shell: pwsh
         run: |
           $out = Join-Path $env:RUNNER_TEMP "flocks-staging"
-          & "${{ github.workspace }}/packaging/windows/build-installer.ps1" -OutputDir $out -RepoRoot "${{ github.workspace }}"
+          $tag = "${{ github.ref_name }}"
+          $appVersion = $tag.TrimStart('v')
+          & "${{ github.workspace }}/packaging/windows/build-installer.ps1" `
+            -OutputDir $out `
+            -RepoRoot "${{ github.workspace }}" `
+            -AppVersion $appVersion
           $builtInstaller = Join-Path "${{ github.workspace }}" "packaging/windows/Output/FlocksSetup.exe"
           if (-not (Test-Path $builtInstaller)) {
             throw "Installer not found: $builtInstaller"
           }
-          $name = "FlocksSetup-${{ github.ref_name }}.exe"
+          $name = "FlocksSetup-${tag}.exe"
           $installer = Join-Path $env:RUNNER_TEMP $name
           Copy-Item -Path $builtInstaller -Destination $installer -Force
           Add-Content -Path $env:GITHUB_OUTPUT -Value "installer_path=$installer" -Encoding utf8NoBOM
@@ -42,5 +47,6 @@ jobs:
         with:
           files: ${{ steps.pack.outputs.installer_path }}
           generate_release_notes: true
+          fail_on_unmatched_files: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

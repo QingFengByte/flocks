@@ -172,20 +172,31 @@ Copy-Item -Path (Join-Path $inner.FullName "*") -Destination $toolsNode -Recurse
 Remove-PathWithRetry -Path $nodeExtract
 
 # Chrome for Testing (bundled browser for agent-browser; prefer cached zip over npm-mediated install)
+# Use the pinned version from the manifest when available (reproducible builds); fall back to LKGR.
 Write-Host "[build-staging] Installing Chrome for Testing to tools\chrome (prefers cached direct download)..."
-$lkgrUrl = "https://googlechromelabs.github.io/chrome-for-testing/last-known-good-versions-with-downloads.json"
-$lkgr = Invoke-WebRequest -Uri $lkgrUrl -UseBasicParsing | Select-Object -ExpandProperty Content | ConvertFrom-Json
-$stable = $lkgr.channels.Stable
-if (-not $stable) {
-    throw "Failed to resolve Stable channel from Chrome for Testing metadata"
+$pinnedCftVersion = $manifest.chrome_for_testing.version
+if (-not [string]::IsNullOrWhiteSpace($pinnedCftVersion)) {
+    Write-Host "[build-staging] Using pinned Chrome for Testing version: $pinnedCftVersion"
+    $cftVersion = $pinnedCftVersion
+    $cftUrl = "https://storage.googleapis.com/chrome-for-testing-public/$cftVersion/win64/chrome-win64.zip"
 }
-$stableChrome = $stable.downloads.chrome | Where-Object { $_.platform -eq "win64" } | Select-Object -First 1
-if (-not $stableChrome) {
-    throw "Failed to resolve win64 download URL from Chrome for Testing metadata"
+else {
+    Write-Host "[build-staging] No pinned Chrome version in manifest — resolving via LKGR..."
+    $lkgrUrl = "https://googlechromelabs.github.io/chrome-for-testing/last-known-good-versions-with-downloads.json"
+    $lkgr = Invoke-WebRequest -Uri $lkgrUrl -UseBasicParsing | Select-Object -ExpandProperty Content | ConvertFrom-Json
+    $stable = $lkgr.channels.Stable
+    if (-not $stable) {
+        throw "Failed to resolve Stable channel from Chrome for Testing metadata"
+    }
+    $stableChrome = $stable.downloads.chrome | Where-Object { $_.platform -eq "win64" } | Select-Object -First 1
+    if (-not $stableChrome) {
+        throw "Failed to resolve win64 download URL from Chrome for Testing metadata"
+    }
+    $cftVersion = $stable.version
+    $cftUrl = $stableChrome.url
 }
-$cftVersion = $stable.version
-$cftZip = Join-Path $cacheRoot ("downloads\\chrome-for-testing-win64-stable-" + $cftVersion + ".zip")
-Get-OrDownloadFile -Url $stableChrome.url -CachePath $cftZip -Label ("Chrome for Testing " + $cftVersion)
+$cftZip = Join-Path $cacheRoot ("downloads\\chrome-for-testing-win64-" + $cftVersion + ".zip")
+Get-OrDownloadFile -Url $cftUrl -CachePath $cftZip -Label ("Chrome for Testing " + $cftVersion)
 
 $cftExtract = Join-Path $env:TEMP ("cft-extract-" + $cftVersion)
 Remove-PathWithRetry -Path $cftExtract
@@ -227,7 +238,9 @@ if ($LASTEXITCODE -ge 8) {
 # robocopy uses 0-7 as success states; normalize process exit code for callers.
 $global:LASTEXITCODE = 0
 
-$binDir = Join-Path $OutputDir "bin"
-New-Item -ItemType Directory -Path $binDir -Force | Out-Null
+# Note: the CLI wrapper ({HOME}\.local\bin\flocks.cmd) is created by
+# scripts\install.ps1 during the post-install bootstrap. We deliberately do
+# not pre-create an {app}\bin directory here, so the install layout stays in
+# sync with the Inno shortcut targets.
 
 Write-Host "[build-staging] Done. Next: compile installer with flocks-setup.iss, or use build-installer.ps1 for one-step packaging."

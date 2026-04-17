@@ -1372,6 +1372,22 @@ def build_frontend_env(config: ServiceConfig) -> dict[str, str]:
     """Build frontend proxy environment variables from backend service settings."""
     env = os.environ.copy()
     env["FLOCKS_API_PROXY_TARGET"] = backend_access_base_url(config)
+
+    # When using the bundled toolchain (Windows installer), npm/node spawned by
+    # `npm run build/preview` must be able to locate the bundled node.exe via
+    # PATH — npm itself does not always inherit the caller's resolved executable
+    # location.  Prepend the bundled node directory when present.
+    node_dir = _bundled_node_install_dir()
+    if node_dir is not None:
+        if sys.platform == "win32":
+            node_bin = str(node_dir)
+        else:
+            node_bin = str(node_dir / "bin")
+        path_sep = os.pathsep
+        current_path = env.get("PATH", "")
+        if node_bin not in current_path.split(path_sep):
+            env["PATH"] = node_bin + path_sep + current_path
+
     return env
 
 

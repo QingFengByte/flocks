@@ -6,8 +6,12 @@
   #define StagingRoot "dist\staging"
 #endif
 
+#ifndef AppVersion
+  #define AppVersion "0.0.0-dev"
+#endif
+
 #define MyAppName "Flocks"
-#define MyAppVersion "2026.4.16"
+#define MyAppVersion AppVersion
 #define MyAppPublisher "Flocks"
 
 [Setup]
@@ -27,6 +31,13 @@ ChangesEnvironment=yes
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
 
+; Remind the user to reopen their terminal so a fresh process picks up the
+; HKCU\Environment entries (FLOCKS_INSTALL_ROOT / FLOCKS_NODE_HOME / PATH)
+; written during install; cmd.exe doesn't respond to WM_SETTINGCHANGE, so
+; any pre-existing shells keep stale env vars.
+[Messages]
+FinishedLabel=Setup has finished installing [name] on your computer.%n%nPlease open a NEW terminal window before running `flocks start`, so the updated environment variables (PATH, FLOCKS_NODE_HOME, ...) take effect.%n%n请重新打开终端窗口后再执行 `flocks start`，以便新的环境变量（PATH、FLOCKS_NODE_HOME 等）生效。
+
 [Tasks]
 Name: "desktopicon"; Description: "Create a &desktop shortcut"; GroupDescription: "Additional icons:"
 
@@ -38,10 +49,13 @@ Root: HKCU; Subkey: "Environment"; ValueType: string; ValueName: "FLOCKS_INSTALL
 Root: HKCU; Subkey: "Environment"; ValueType: string; ValueName: "FLOCKS_REPO_ROOT"; ValueData: "{app}\flocks"; Flags: uninsdeletevalue
 Root: HKCU; Subkey: "Environment"; ValueType: string; ValueName: "FLOCKS_NODE_HOME"; ValueData: "{app}\tools\node"; Flags: uninsdeletevalue
 
+; Shortcuts intentionally target the same wrapper path that `scripts\install.ps1`
+; writes, so the Start menu / desktop icon and `flocks start` typed in a new
+; terminal are strictly equivalent across all install flows.
 [Icons]
-Name: "{autoprograms}\{#MyAppName}\Start Flocks"; Filename: "{app}\bin\flocks.cmd"; Parameters: "start"; WorkingDir: "{app}"
+Name: "{autoprograms}\{#MyAppName}\Start Flocks"; Filename: "{%USERPROFILE}\.local\bin\flocks.cmd"; Parameters: "start"; WorkingDir: "{%USERPROFILE}"
 Name: "{autoprograms}\{#MyAppName}\Flocks repository"; Filename: "{app}\flocks"; WorkingDir: "{app}\flocks"
-Name: "{userdesktop}\{#MyAppName}"; Filename: "{app}\bin\flocks.cmd"; Parameters: "start"; WorkingDir: "{app}"; Tasks: desktopicon
+Name: "{userdesktop}\{#MyAppName}"; Filename: "{%USERPROFILE}\.local\bin\flocks.cmd"; Parameters: "start"; WorkingDir: "{%USERPROFILE}"; Tasks: desktopicon
 
 [Run]
-Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\flocks\scripts\bootstrap-windows.ps1"" -InstallRoot ""{app}"""; StatusMsg: "Setting up Python and JavaScript dependencies..."; Flags: runascurrentuser waituntilterminated
+Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\flocks\packaging\windows\bootstrap-windows.ps1"" -InstallRoot ""{app}"""; StatusMsg: "Setting up Python and JavaScript dependencies..."; Flags: runascurrentuser waituntilterminated

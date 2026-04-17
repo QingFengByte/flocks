@@ -65,6 +65,63 @@ def test_resolve_node_executable_prefers_flocks_install_root_tools_node(
     assert Path(resolved).name in ("node", "node.exe")
 
 
+def test_resolve_node_executable_falls_back_to_which_when_env_absent(
+    monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.delenv("FLOCKS_NODE_HOME", raising=False)
+    monkeypatch.delenv("FLOCKS_INSTALL_ROOT", raising=False)
+    monkeypatch.setattr(service_manager, "which", lambda name: "/usr/bin/node" if name == "node" else None)
+
+    assert service_manager.resolve_node_executable() == "/usr/bin/node"
+
+
+def test_resolve_node_executable_falls_back_to_which_when_path_missing(
+    monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.delenv("FLOCKS_INSTALL_ROOT", raising=False)
+    monkeypatch.setenv("FLOCKS_NODE_HOME", str(tmp_path / "nonexistent"))
+    monkeypatch.setattr(service_manager, "which", lambda name: "/usr/bin/node" if name == "node" else None)
+
+    assert service_manager.resolve_node_executable() == "/usr/bin/node"
+
+
+def test_build_frontend_env_prepends_bundled_node_to_path(
+    monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.delenv("FLOCKS_INSTALL_ROOT", raising=False)
+    node_home = tmp_path / "tools" / "node"
+    if sys.platform == "win32":
+        node_home.mkdir(parents=True)
+        (node_home / "node.exe").write_bytes(b"")
+    else:
+        (node_home / "bin").mkdir(parents=True)
+        (node_home / "bin" / "node").write_bytes(b"")
+    monkeypatch.setenv("FLOCKS_NODE_HOME", str(node_home))
+
+    config = service_manager.ServiceConfig(backend_host="127.0.0.1", backend_port=8000)
+    env = service_manager.build_frontend_env(config)
+
+    path_entries = env["PATH"].split(service_manager.os.pathsep)
+    if sys.platform == "win32":
+        assert path_entries[0] == str(node_home)
+    else:
+        assert path_entries[0] == str(node_home / "bin")
+
+
+def test_build_frontend_env_no_path_injection_without_bundled_node(
+    monkeypatch,
+) -> None:
+    monkeypatch.delenv("FLOCKS_NODE_HOME", raising=False)
+    monkeypatch.delenv("FLOCKS_INSTALL_ROOT", raising=False)
+
+    import os as _os
+    original_path = _os.environ.get("PATH", "")
+    config = service_manager.ServiceConfig(backend_host="127.0.0.1", backend_port=8000)
+    env = service_manager.build_frontend_env(config)
+
+    assert env["PATH"] == original_path
+
+
 def test_cleanup_stale_pid_file_removes_dead_pid(tmp_path: Path) -> None:
     pid_file = tmp_path / "backend.pid"
     pid_file.write_text("999999", encoding="utf-8")
