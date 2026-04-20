@@ -29,13 +29,30 @@ from flocks.session.lifecycle.compaction.compaction import (
 
 
 @pytest.fixture(autouse=True)
-def _reset_flush_state(monkeypatch):
-    """Make sure leftover tasks/locks from earlier tests do not leak in."""
+async def _reset_flush_state(monkeypatch):
+    """Cancel/reset any flush state so tests do not bleed into one another."""
+    # Pre-test: hard reset.
+    for t in list(compaction_mod._pending_flush_tasks):
+        t.cancel()
+    if compaction_mod._pending_flush_tasks:
+        await asyncio.gather(
+            *compaction_mod._pending_flush_tasks, return_exceptions=True
+        )
     compaction_mod._pending_flush_tasks.clear()
     compaction_mod._session_flush_locks.clear()
     monkeypatch.delenv("FLOCKS_COMPACTION_FLUSH_BACKGROUND", raising=False)
     monkeypatch.delenv("FLOCKS_COMPACTION_FLUSH_TIMEOUT", raising=False)
+
     yield
+
+    # Post-test: cancel anything still alive before the loop tears down so
+    # we never trigger "Task was destroyed but it is pending!" warnings.
+    for t in list(compaction_mod._pending_flush_tasks):
+        t.cancel()
+    if compaction_mod._pending_flush_tasks:
+        await asyncio.gather(
+            *compaction_mod._pending_flush_tasks, return_exceptions=True
+        )
     compaction_mod._pending_flush_tasks.clear()
     compaction_mod._session_flush_locks.clear()
 
@@ -199,7 +216,7 @@ async def test_different_sessions_flush_in_parallel(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_background_flush_times_out(monkeypatch, caplog):
+async def test_background_flush_times_out(monkeypatch):
     """A stuck flush must be cancelled by the wait_for guard."""
     monkeypatch.setenv("FLOCKS_COMPACTION_FLUSH_TIMEOUT", "0.05")
 
@@ -223,13 +240,171 @@ async def test_background_flush_times_out(monkeypatch, caplog):
 
 
 # ---------------------------------------------------------------------------
+# Lock registry cleanup (no per-session memory leak)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_session_lock_released_after_completion(monkeypatch):
+    """``_session_flush_locks`` must not retain dead session entries."""
+    async def fake_flush(**kwargs):
+        return None
+
+    _patch_flush(monkeypatch, fake_flush)
+
+    await SessionCompaction._dispatch_memory_flush(
+        session_id="ephemeral-1",
+        summary_text="x",
+        chat_messages=[],
+        model_id="m",
+        provider_client=object(),
+        ChatMessage=object,
+        policy=None,
+    )
+    await drain_pending_flush_tasks(timeout=2.0)
+
+    assert "ephemeral-1" not in compaction_mod._session_flush_locks
+
+
+@pytest.mark.asyncio
+async def test_session_lock_kept_while_other_task_pending(monkeypatch):
+    """Cleanup must not drop the lock while another same-session task is queued."""
+    release = asyncio.Event()
+    seen_first = asyncio.Event()
+    call_count = 0
+
+    async def fake_flush(**kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            seen_first.set()
+            await release.wait()
+
+    _patch_flush(monkeypatch, fake_flush)
+
+    await SessionCompaction._dispatch_memory_flush(
+        session_id="busy",
+        summary_text="x",
+        chat_messages=[],
+        model_id="m",
+        provider_client=object(),
+        ChatMessage=object,
+        policy=None,
+    )
+    await asyncio.wait_for(seen_first.wait(), timeout=1.0)
+
+    # Second dispatch is queued waiting on the per-session lock.
+    await SessionCompaction._dispatch_memory_flush(
+        session_id="busy",
+        summary_text="x",
+        chat_messages=[],
+        model_id="m",
+        provider_client=object(),
+        ChatMessage=object,
+        policy=None,
+    )
+
+    # While both tasks are alive the lock must still be registered.
+    assert "busy" in compaction_mod._session_flush_locks
+
+    release.set()
+    await drain_pending_flush_tasks(timeout=3.0)
+
+    # After both finish, the registry should be empty for this session.
+    assert "busy" not in compaction_mod._session_flush_locks
+
+
+# ---------------------------------------------------------------------------
 # drain helper
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
 async def test_drain_returns_quickly_when_no_pending_tasks():
-    await drain_pending_flush_tasks(timeout=5.0)
+    leftover = await drain_pending_flush_tasks(timeout=5.0)
+    assert leftover == 0
+
+
+@pytest.mark.asyncio
+async def test_drain_reports_leftover_without_cancel(monkeypatch):
+    """Default behaviour: leftover tasks survive drain timeout."""
+    release = asyncio.Event()
+
+    async def fake_flush(**kwargs):
+        await release.wait()
+
+    _patch_flush(monkeypatch, fake_flush)
+
+    await SessionCompaction._dispatch_memory_flush(
+        session_id="slow",
+        summary_text="x",
+        chat_messages=[],
+        model_id="m",
+        provider_client=object(),
+        ChatMessage=object,
+        policy=None,
+    )
+
+    leftover = await drain_pending_flush_tasks(timeout=0.05)
+    assert leftover == 1
+    assert len(compaction_mod._pending_flush_tasks) == 1
+
+    # Clean up so the autouse fixture doesn't have to cancel mid-flight.
+    release.set()
+    await drain_pending_flush_tasks(timeout=2.0)
+
+
+@pytest.mark.asyncio
+async def test_drain_cancel_on_timeout_clears_pending(monkeypatch):
+    """``cancel_on_timeout=True`` must leave the pending set empty."""
+    async def fake_flush(**kwargs):
+        await asyncio.sleep(10.0)
+
+    _patch_flush(monkeypatch, fake_flush)
+
+    await SessionCompaction._dispatch_memory_flush(
+        session_id="hangs",
+        summary_text="x",
+        chat_messages=[],
+        model_id="m",
+        provider_client=object(),
+        ChatMessage=object,
+        policy=None,
+    )
+
+    leftover = await drain_pending_flush_tasks(
+        timeout=0.05, cancel_on_timeout=True,
+    )
+    assert leftover == 0
+    assert not compaction_mod._pending_flush_tasks
+
+
+# ---------------------------------------------------------------------------
+# Timeout-env parsing
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "raw, expected",
+    [
+        (None, float(compaction_mod._DEFAULT_FLUSH_TIMEOUT_SECONDS)),
+        ("", float(compaction_mod._DEFAULT_FLUSH_TIMEOUT_SECONDS)),
+        ("   ", float(compaction_mod._DEFAULT_FLUSH_TIMEOUT_SECONDS)),
+        ("0", float(compaction_mod._DEFAULT_FLUSH_TIMEOUT_SECONDS)),
+        ("-5", float(compaction_mod._DEFAULT_FLUSH_TIMEOUT_SECONDS)),
+        ("not-a-number", float(compaction_mod._DEFAULT_FLUSH_TIMEOUT_SECONDS)),
+        ("90", 90.0),
+        ("1.5", 1.5),
+    ],
+)
+@pytest.mark.asyncio
+async def test_flush_timeout_parsing(monkeypatch, raw, expected):
+    # async so the autouse async fixture can apply.
+    if raw is None:
+        monkeypatch.delenv("FLOCKS_COMPACTION_FLUSH_TIMEOUT", raising=False)
+    else:
+        monkeypatch.setenv("FLOCKS_COMPACTION_FLUSH_TIMEOUT", raw)
+    assert compaction_mod._flush_timeout_seconds() == expected
 
 
 # ---------------------------------------------------------------------------

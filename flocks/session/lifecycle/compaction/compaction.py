@@ -56,7 +56,13 @@ log = Log.create(service="session.compaction")
 # synchronous behaviour (useful for tests or debugging).
 
 _FLUSH_TASK_NAME_PREFIX = "compaction.flush."
-_DEFAULT_FLUSH_TIMEOUT_SECONDS = 600
+
+# Default upper bound on a single background flush.  ``extract_and_save``
+# normally finishes in 5–30s; 90s gives us ~3x slack for cold provider
+# starts / large contexts without holding ``chat_messages`` references for
+# minutes when the LLM call truly wedges.  Override per deployment via
+# ``FLOCKS_COMPACTION_FLUSH_TIMEOUT``.
+_DEFAULT_FLUSH_TIMEOUT_SECONDS = 90
 
 _pending_flush_tasks: set[asyncio.Task] = set()
 _session_flush_locks: dict[str, asyncio.Lock] = {}
@@ -93,57 +99,120 @@ def _get_flush_lock(session_id: str) -> asyncio.Lock:
     return lock
 
 
-def _session_id_from_task(task: asyncio.Task) -> str:
+def _release_session_lock_if_idle(session_id: str, lock: asyncio.Lock) -> None:
+    """Drop ``session_id``'s lock entry if no other task still needs it.
+
+    Called after a background flush finishes.  Without this the
+    ``_session_flush_locks`` registry would grow unboundedly across the
+    lifetime of a long-running process (each new session_id is unique).
+
+    Safe under asyncio's single-threaded scheduler:
+      * we exclude the *current* task (its done-callback hasn't run yet
+        so it is still in ``_pending_flush_tasks``);
+      * we only pop the entry when it is *still* the same Lock instance
+        we acquired, defending against an interleaved dispatch having
+        replaced it (cannot happen today but cheap to be safe).
+    """
+    current = asyncio.current_task()
+    for t in _pending_flush_tasks:
+        if t is current:
+            continue
+        if t.done():
+            continue
+        if _session_id_from_task(t) == session_id:
+            return
+    if _session_flush_locks.get(session_id) is lock:
+        _session_flush_locks.pop(session_id, None)
+
+
+def _session_id_from_task(task: asyncio.Task) -> Optional[str]:
+    """Return the session_id encoded in a flush task's name, or None."""
     name = task.get_name() or ""
     if name.startswith(_FLUSH_TASK_NAME_PREFIX):
         return name[len(_FLUSH_TASK_NAME_PREFIX):]
-    return ""
+    return None
 
 
 def _on_flush_task_done(task: asyncio.Task) -> None:
     _pending_flush_tasks.discard(task)
     session_id = _session_id_from_task(task)
+    payload: Dict[str, Any] = {"task": task.get_name()}
+    if session_id is not None:
+        payload["session_id"] = session_id
     if task.cancelled():
-        log.info("compaction.flush.background.cancelled", {
-            "session_id": session_id,
-            "task": task.get_name(),
-        })
+        log.info("compaction.flush.background.cancelled", payload)
         return
     exc = task.exception()
     if exc is not None:
-        log.warn("compaction.flush.background.error", {
-            "session_id": session_id,
-            "task": task.get_name(),
+        # Unexpected exception (network, disk, ...).  TimeoutError is
+        # already absorbed inside ``_runner`` and never reaches here, so
+        # anything we see is genuinely unplanned and worth ERROR level.
+        log.error("compaction.flush.background.error", {
+            **payload,
             "error": str(exc),
             "error_type": type(exc).__name__,
         })
     else:
-        log.debug("compaction.flush.background.done", {
-            "session_id": session_id,
-            "task": task.get_name(),
-        })
+        log.debug("compaction.flush.background.done", payload)
 
 
-async def drain_pending_flush_tasks(timeout: float = 30.0) -> None:
+async def drain_pending_flush_tasks(
+    timeout: float = 30.0,
+    *,
+    cancel_on_timeout: bool = False,
+) -> int:
     """Await all in-flight background flush tasks.
 
     Intended for graceful process shutdown / test fixtures so that
     fire-and-forget flushes do not get cancelled with their daily-memory
-    writes half-applied.  Returns once every pending task has finished or
-    *timeout* seconds have elapsed (whichever comes first).
+    writes half-applied.
+
+    Args:
+        timeout: Wall-clock seconds to wait for pending tasks.
+        cancel_on_timeout: When True, leftover tasks are cancelled and
+            briefly awaited so the caller can close the event loop
+            cleanly.  Use this from shutdown paths.  When False (default),
+            leftover tasks are logged at WARN and left running — the
+            caller is expected to keep the loop alive.
+
+    Returns:
+        The number of tasks that were *still pending* when the function
+        returned (always 0 when ``cancel_on_timeout=True``).
     """
     if not _pending_flush_tasks:
-        return
+        return 0
     pending = list(_pending_flush_tasks)
     log.info("compaction.flush.drain.start", {
         "pending": len(pending),
         "timeout": timeout,
+        "cancel_on_timeout": cancel_on_timeout,
     })
     done, still_pending = await asyncio.wait(pending, timeout=timeout)
+
+    leftover = len(still_pending)
+    if still_pending:
+        names = [t.get_name() for t in still_pending]
+        if cancel_on_timeout:
+            for t in still_pending:
+                t.cancel()
+            # Absorb CancelledError so the loop can be torn down.
+            await asyncio.gather(*still_pending, return_exceptions=True)
+            log.warn("compaction.flush.drain.cancelled_pending", {
+                "cancelled": leftover,
+                "task_names": names,
+            })
+            leftover = 0
+        else:
+            log.warn("compaction.flush.drain.timeout_pending", {
+                "still_pending": leftover,
+                "task_names": names,
+            })
+
     log.info("compaction.flush.drain.complete", {
         "drained": len(done),
-        "still_pending": len(still_pending),
+        "still_pending": leftover,
     })
+    return leftover
 
 
 class SessionCompaction:
@@ -313,28 +382,34 @@ class SessionCompaction:
         async def _runner() -> None:
             lock = _get_flush_lock(session_id)
             wait_started = time.perf_counter()
-            async with lock:
-                wait_ms = (time.perf_counter() - wait_started) * 1000.0
-                run_started = time.perf_counter()
-                try:
-                    await asyncio.wait_for(
-                        cls._flush_memory_to_daily(**kwargs),
-                        timeout=timeout_s,
-                    )
-                    duration_ms = (time.perf_counter() - run_started) * 1000.0
-                    log.info("compaction.flush.background.completed", {
-                        "session_id": session_id,
-                        "wait_ms": round(wait_ms, 2),
-                        "duration_ms": round(duration_ms, 2),
-                    })
-                except asyncio.TimeoutError:
-                    duration_ms = (time.perf_counter() - run_started) * 1000.0
-                    log.error("compaction.flush.background.timeout", {
-                        "session_id": session_id,
-                        "wait_ms": round(wait_ms, 2),
-                        "duration_ms": round(duration_ms, 2),
-                        "timeout_s": timeout_s,
-                    })
+            try:
+                async with lock:
+                    wait_ms = (time.perf_counter() - wait_started) * 1000.0
+                    run_started = time.perf_counter()
+                    try:
+                        await asyncio.wait_for(
+                            cls._flush_memory_to_daily(**kwargs),
+                            timeout=timeout_s,
+                        )
+                        duration_ms = (time.perf_counter() - run_started) * 1000.0
+                        log.info("compaction.flush.background.completed", {
+                            "session_id": session_id,
+                            "wait_ms": round(wait_ms, 2),
+                            "duration_ms": round(duration_ms, 2),
+                        })
+                    except asyncio.TimeoutError:
+                        duration_ms = (time.perf_counter() - run_started) * 1000.0
+                        # Known failure mode that we deliberately bound;
+                        # WARN keeps it out of error-rate alerts while
+                        # still surfacing in dashboards.
+                        log.warn("compaction.flush.background.timeout", {
+                            "session_id": session_id,
+                            "wait_ms": round(wait_ms, 2),
+                            "duration_ms": round(duration_ms, 2),
+                            "timeout_s": timeout_s,
+                        })
+            finally:
+                _release_session_lock_if_idle(session_id, lock)
 
         flush_task = asyncio.create_task(
             _runner(),
