@@ -276,6 +276,24 @@ def resolve_node_executable() -> str | None:
     return which("node")
 
 
+def resolve_npm_executable() -> str | None:
+    """Resolve npm from bundled toolchain first, then PATH."""
+    node_dir = _bundled_node_install_dir()
+    if node_dir is not None:
+        candidates = (
+            [node_dir / "npm.cmd", node_dir / "npm", node_dir / "bin/npm"]
+            if sys.platform == "win32"
+            else [node_dir / "bin/npm", node_dir / "npm"]
+        )
+        for candidate in candidates:
+            if candidate.exists():
+                return str(candidate)
+
+    if sys.platform == "win32":
+        return which("npm.cmd") or which("npm")
+    return which("npm") or which("npm.cmd")
+
+
 def get_node_major_version() -> int | None:
     """Return the detected Node.js major version."""
     node = resolve_node_executable()
@@ -816,7 +834,7 @@ def start_frontend(config: ServiceConfig, console) -> None:
     if runtime_record is not None:
         paths.frontend_pid.unlink(missing_ok=True)
 
-    npm = which("npm") or which("npm.cmd")
+    npm = resolve_npm_executable()
     if not npm:
         raise ServiceError("未检测到 npm，请先安装 Node.js 22+（包含 npm）后重试。")
     if not node_version_satisfies_requirement():

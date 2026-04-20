@@ -85,6 +85,41 @@ def test_resolve_node_executable_falls_back_to_which_when_path_missing(
     assert service_manager.resolve_node_executable() == "/usr/bin/node"
 
 
+def test_resolve_npm_executable_prefers_flocks_node_home(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.delenv("FLOCKS_INSTALL_ROOT", raising=False)
+    home = tmp_path / "nh"
+    home.mkdir()
+    if sys.platform == "win32":
+        (home / "node.exe").write_bytes(b"")
+        bundled_npm = home / "npm.cmd"
+    else:
+        (home / "bin").mkdir()
+        (home / "bin" / "node").write_bytes(b"")
+        bundled_npm = home / "bin" / "npm"
+    bundled_npm.write_bytes(b"")
+    monkeypatch.setenv("FLOCKS_NODE_HOME", str(home))
+    monkeypatch.setattr(service_manager, "which", lambda name: "/usr/bin/npm")
+
+    resolved = service_manager.resolve_npm_executable()
+
+    assert resolved == str(bundled_npm)
+
+
+def test_resolve_npm_executable_falls_back_to_which(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.delenv("FLOCKS_NODE_HOME", raising=False)
+    monkeypatch.delenv("FLOCKS_INSTALL_ROOT", raising=False)
+    monkeypatch.setattr(service_manager.sys, "platform", "win32")
+
+    def fake_which(name: str) -> str | None:
+        if name == "npm.cmd":
+            return r"C:\Program Files\nodejs\npm.cmd"
+        return None
+
+    monkeypatch.setattr(service_manager, "which", fake_which)
+
+    assert service_manager.resolve_npm_executable() == r"C:\Program Files\nodejs\npm.cmd"
+
+
 def test_build_frontend_env_prepends_bundled_node_to_path(
     monkeypatch, tmp_path: Path
 ) -> None:
@@ -742,7 +777,7 @@ def test_start_frontend_passes_backend_urls_to_build_and_preview(monkeypatch, tm
     monkeypatch.setattr(service_manager, "port_owner_pids", lambda _port: [])
     monkeypatch.setattr(service_manager, "wait_for_http", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(service_manager.os, "getpgid", lambda pid: pid)
-    monkeypatch.setattr(service_manager, "which", lambda name: "/usr/bin/npm" if name in {"npm", "npm.cmd"} else None)
+    monkeypatch.setattr(service_manager, "resolve_npm_executable", lambda: "/usr/bin/npm")
     monkeypatch.setattr(service_manager, "node_version_satisfies_requirement", lambda: True)
     monkeypatch.setattr(service_manager.subprocess, "run", fake_run)
     monkeypatch.setattr(service_manager, "_spawn_process", fake_spawn)
@@ -778,6 +813,41 @@ def test_start_frontend_passes_backend_urls_to_build_and_preview(monkeypatch, tm
     assert record is not None
     assert record.host == "0.0.0.0"
     assert record.port == 5174
+
+
+def test_start_frontend_prefers_bundled_npm_over_path_lookup(monkeypatch, tmp_path: Path) -> None:
+    paths = service_manager.RuntimePaths(
+        root=tmp_path,
+        run_dir=tmp_path / "run",
+        log_dir=tmp_path / "logs",
+        backend_pid=tmp_path / "run" / "backend.pid",
+        frontend_pid=tmp_path / "run" / "webui.pid",
+        backend_log=tmp_path / "logs" / "backend.log",
+        frontend_log=tmp_path / "logs" / "webui.log",
+    )
+    paths.run_dir.mkdir(parents=True)
+    paths.log_dir.mkdir(parents=True)
+    console = DummyConsole()
+    build_calls: list[list[str]] = []
+
+    def fake_run(command, **_kwargs):
+        build_calls.append(command)
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(service_manager, "ensure_install_layout", lambda: tmp_path)
+    monkeypatch.setattr(service_manager, "ensure_runtime_dirs", lambda: paths)
+    monkeypatch.setattr(service_manager, "cleanup_stale_pid_file", lambda _path: None)
+    monkeypatch.setattr(service_manager, "port_owner_pids", lambda _port: [])
+    monkeypatch.setattr(service_manager, "wait_for_http", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(service_manager.os, "getpgid", lambda pid: pid)
+    monkeypatch.setattr(service_manager, "resolve_npm_executable", lambda: r"C:\Users\flocks\AppData\Local\Programs\Flocks\tools\node\npm.cmd")
+    monkeypatch.setattr(service_manager, "node_version_satisfies_requirement", lambda: True)
+    monkeypatch.setattr(service_manager.subprocess, "run", fake_run)
+    monkeypatch.setattr(service_manager, "_spawn_process", lambda *_args, **_kwargs: SimpleNamespace(pid=2468))
+
+    service_manager.start_frontend(service_manager.ServiceConfig(), console)
+
+    assert build_calls[0][0] == r"C:\Users\flocks\AppData\Local\Programs\Flocks\tools\node\npm.cmd"
 
 
 def test_start_backend_raises_on_port_record_mismatch(monkeypatch, tmp_path: Path) -> None:
