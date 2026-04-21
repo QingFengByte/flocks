@@ -401,14 +401,14 @@ class ChannelConfig(BaseModel):
     Platform-specific fields (appId, appSecret, …) are captured via
     ``extra = "allow"`` and can be accessed with ``get_extra()``.
 
-    Feishu-specific fields (新增)：
-    - ``inboundDebounceMs``: 消息防抖窗口（毫秒），0=禁用，默认 800
-    - ``dedupTtlSeconds``: 去重 TTL（秒），默认 86400（24h）
-    - ``reactionNotifications``: Emoji 响应策略 off/own/all，默认 off
-    - ``streaming``: 是否启用流式卡片输出，默认 False
-    - ``streamingCoalesceMs``: 流式节流窗口（毫秒），默认 200
-    - ``groups``: 按 chat_id 的细粒度群组配置
-    - ``mentionContextMessages``: 群聊最近未@消息缓存条数，0=禁用
+    Feishu-specific fields:
+    - ``inboundDebounceMs``: inbound debounce window in milliseconds; 0 disables, default 800
+    - ``dedupTtlSeconds``: deduplication TTL in seconds, default 86400 (24h)
+    - ``reactionNotifications``: emoji reaction policy off/own/all, default off
+    - ``streaming``: whether to enable streaming card output, default False
+    - ``streamingCoalesceMs``: streaming throttle window in milliseconds, default 200
+    - ``groups``: per-chat_id fine-grained group configuration
+    - ``mentionContextMessages``: number of recent un-mentioned messages cached for group chats; 0 disables
     """
     model_config = {"extra": "allow", "populate_by_name": True}
 
@@ -418,37 +418,55 @@ class ChannelConfig(BaseModel):
     group_trigger: Optional[str] = Field("mention", alias="groupTrigger")
     allow_from: Optional[List[str]] = Field(None, alias="allowFrom")
     accounts: Optional[Dict[str, ChannelAccountConfig]] = None
+    workspace_dir: Optional[str] = Field(
+        None,
+        alias="workspaceDir",
+        description=(
+            "Working directory used when this channel auto-creates a Flocks session. "
+            "Channel inbound runs in a background asyncio task that is NOT wrapped "
+            "by the HTTP Instance middleware, so the project Instance ContextVar is "
+            "typically empty for channel dispatch and the resolver falls back to "
+            "the server process cwd. To make channel-originated sessions inject the "
+            "same <env>, AGENTS.md / CLAUDE.md / CONTEXT.md and sandbox prompts as "
+            "WebUI sessions, set this explicitly to the same directory the WebUI "
+            "server was launched against (the value normally passed via the "
+            "x-flocks-directory request header)."
+        ),
+    )
 
-    # ── Feishu 新增字段 ──────────────────────────────────────────────
+    # ── Feishu-specific fields ──────────────────────────────────────────
     inbound_debounce_ms: Optional[int] = Field(
         800, alias="inboundDebounceMs", ge=0,
-        description="消息防抖窗口（毫秒），0=禁用",
+        description="Inbound debounce window in milliseconds; 0 disables.",
     )
     dedup_ttl_seconds: Optional[int] = Field(
         86400, alias="dedupTtlSeconds", ge=60,
-        description="去重 TTL（秒），默认 86400（24h）",
+        description="Deduplication TTL in seconds, default 86400 (24h).",
     )
     reaction_notifications: Optional[Literal["off", "own", "all"]] = Field(
         "off", alias="reactionNotifications",
-        description="Emoji Reaction 响应策略",
+        description="Emoji reaction notification policy.",
     )
     streaming: Optional[bool] = Field(
         False,
-        description="是否启用流式卡片输出（需要 cardkit:card:write 权限）",
+        description=(
+            "Whether to enable streaming card output "
+            "(requires the cardkit:card:write permission)."
+        ),
     )
     streaming_coalesce_ms: Optional[int] = Field(
         200, alias="streamingCoalesceMs", ge=0,
-        description="流式卡片追加节流窗口（毫秒）",
+        description="Streaming card append throttle window in milliseconds.",
     )
     groups: Optional[Dict[str, Optional[FeishuGroupConfig]]] = Field(
         None,
-        description="按 chat_id 的细粒度群组配置，支持通配符 '*'",
+        description="Per-chat_id fine-grained group configuration; supports the '*' wildcard.",
     )
     mention_context_messages: Optional[int] = Field(
         0,
         alias="mentionContextMessages",
         ge=0,
-        description="群聊最近未@消息缓存条数，0=禁用",
+        description="Number of recent un-mentioned messages cached for group chats; 0 disables.",
     )
 
     def get_extra(self, key: str, default: Any = None) -> Any:
@@ -524,7 +542,7 @@ class ConfigInfo(BaseModel):
         description="Memory system configuration"
     )
     
-    # Sandbox configuration (对齐 OpenClaw agents.defaults.sandbox)
+    # Sandbox configuration (aligned with OpenClaw agents.defaults.sandbox)
     sandbox: Optional[Dict[str, Any]] = Field(
         None,
         description=(

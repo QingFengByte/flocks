@@ -106,8 +106,53 @@ async def _get_db() -> aiosqlite.Connection:
         await _db_conn.execute("PRAGMA journal_mode=WAL")
         await _db_conn.execute("PRAGMA busy_timeout=5000")
         await _db_conn.executescript(_DDL)
+        await _migrate_legacy_binding_agent_ids(_db_conn)
         _db_ready = True
         return _db_conn
+
+
+async def _migrate_legacy_binding_agent_ids(db: aiosqlite.Connection) -> None:
+    """One-shot normalisation of pre-unification ``channel_bindings.agent_id``.
+
+    Older builds of the dispatcher used ``channel_config.default_agent or "default"``
+    as the fallback agent name when binding a new conversation, which persisted
+    the literal string ``"default"`` (and occasionally the empty string) into
+    the ``channel_bindings.agent_id`` column. Now that the dispatcher trusts
+    ``binding.agent_id`` for both ``Message.create(agent=...)`` and
+    ``SessionLoop.run(agent_name=...)``, those legacy values would silently
+    propagate a non-existent agent name through the whole loop, where downstream
+    only avoids breakage thanks to the ``Agent.get(name) or Agent.get("rex")``
+    fallback. That fallback hides the divergence rather than fixing it.
+
+    This migration rewrites those legacy rows to ``NULL`` so that the dispatcher
+    falls back to the proper resolution chain (``ChannelConfig.defaultAgent`` →
+    ``Agent.default_agent()`` → ``"rex"``) on the next inbound message. It is
+    safe to run repeatedly: the WHERE clause is empty after the first pass.
+    """
+    try:
+        cursor = await db.execute(
+            "UPDATE channel_bindings "
+            "SET agent_id = NULL "
+            "WHERE agent_id IN ('default', '')",
+        )
+        rewritten = cursor.rowcount or 0
+        await db.commit()
+        if rewritten > 0:
+            log.info("channel.binding.legacy_agent_id_normalised", {
+                "rows": rewritten,
+                "hint": (
+                    "Pre-unification rows had agent_id='default' (or empty); "
+                    "rewriting to NULL so dispatcher resolves the real default "
+                    "agent on the next inbound message."
+                ),
+            })
+    except Exception as exc:
+        # Migration is best-effort. If it fails (e.g. read-only mount) we
+        # log and keep going — the runtime fallback in runner.py still
+        # protects the prompt content even with the legacy values.
+        log.warning("channel.binding.legacy_agent_id_migration_failed", {
+            "error": str(exc),
+        })
 
 
 async def close_binding_db() -> None:
@@ -130,6 +175,7 @@ class SessionBindingService:
         msg: InboundMessage,
         default_agent: Optional[str] = None,
         scope_override: Optional[GroupSessionScope] = None,
+        directory: Optional[str] = None,
     ) -> SessionBinding:
         """Find or create a binding for *msg*.
 
@@ -141,6 +187,12 @@ class SessionBindingService:
                 - ``"group_sender"``: one session per (group, sender) pair.
                 - ``"group_topic"``: one session per topic thread in the group
                   (falls back to per-group if msg.thread_id is absent).
+            directory: Working directory used when a new session has to be
+                created. When ``None``, falls back to the current Project
+                Instance directory and finally ``os.getcwd()``. Aligning this
+                with the WebUI session creation path is what keeps ``<env>``,
+                ``AGENTS.md`` and sandbox prompts consistent across entry
+                points.
         """
         chat_id, thread_id = _resolve_session_key(msg, scope_override)
 
@@ -163,7 +215,7 @@ class SessionBindingService:
             await self.unbind(existing.session_id)
 
         session_id = await self._create_session(
-            msg, default_agent=default_agent,
+            msg, default_agent=default_agent, directory=directory,
         )
         now = time.time()
         binding = SessionBinding(
@@ -334,18 +386,78 @@ class SessionBindingService:
     async def _create_session(
         msg: InboundMessage,
         default_agent: Optional[str] = None,
+        directory: Optional[str] = None,
     ) -> str:
-        """Create a new Flocks Session and return its ID."""
+        """Create a new Flocks Session and return its ID.
+
+        ``directory`` follows the same priority as the WebUI ``Session.create``
+        route: explicit caller value → ``Instance.get_directory()`` → server
+        ``os.getcwd()``. Keeping this aligned ensures channel-originated
+        sessions inject the same ``<env>`` block, AGENTS.md custom rules and
+        sandbox configuration as WebUI sessions.
+        """
         from flocks.session.session import Session
 
         title = _build_title(msg)
         session = await Session.create(
             project_id="channel",
-            directory=os.getcwd(),
+            directory=_resolve_session_directory(directory),
             title=title,
             agent=default_agent,
         )
         return session.id
+
+
+def _resolve_session_directory(explicit: Optional[str]) -> str:
+    """Resolve the working directory for a channel-created session.
+
+    Priority:
+        1. Explicit value passed by the dispatcher (typically from
+           ``ChannelConfig.workspace_dir``).
+        2. The active project Instance directory — only populated when the
+           current task inherits the HTTP middleware's ContextVar, which
+           channel dispatch tasks normally do NOT.
+        3. The server process ``os.getcwd()`` as a last resort.
+
+    When falling back to step 3 we emit a single WARN-level breadcrumb
+    so operators can spot that channel sessions are silently anchored to
+    the server cwd rather than the WebUI project directory, and configure
+    ``ChannelConfig.workspaceDir`` to fix it.
+    """
+    if explicit:
+        return explicit
+    try:
+        from flocks.project.instance import Instance
+        instance_dir = Instance.get_directory()
+        if instance_dir:
+            return instance_dir
+    except Exception:
+        pass
+
+    cwd = os.getcwd()
+    if not _CWD_FALLBACK_WARNED:
+        _mark_cwd_fallback_warned()
+        log.warning("channel.session_directory.cwd_fallback", {
+            "cwd": cwd,
+            "hint": (
+                "ChannelConfig.workspaceDir is unset and no project Instance "
+                "context is available in the channel task; channel-created "
+                "sessions will use the server cwd, which may diverge from "
+                "WebUI sessions. Set channels.<id>.workspaceDir to align."
+            ),
+        })
+    return cwd
+
+
+# Module-level flag so the operator gets the warning exactly once per
+# process — avoids spamming the log on every inbound message while still
+# making the divergence discoverable.
+_CWD_FALLBACK_WARNED: bool = False
+
+
+def _mark_cwd_fallback_warned() -> None:
+    global _CWD_FALLBACK_WARNED
+    _CWD_FALLBACK_WARNED = True
 
 
 def _build_title(msg: InboundMessage) -> str:
