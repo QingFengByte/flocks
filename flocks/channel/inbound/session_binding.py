@@ -369,13 +369,15 @@ def _resolve_session_directory(explicit: Optional[str]) -> str:
     Priority:
         1. Explicit value passed by the dispatcher (typically from
            ``ChannelConfig.workspace_dir``).
-        2. The active project Instance directory (same source the WebUI
-           ``Session.create`` route uses).
+        2. The active project Instance directory — only populated when the
+           current task inherits the HTTP middleware's ContextVar, which
+           channel dispatch tasks normally do NOT.
         3. The server process ``os.getcwd()`` as a last resort.
 
-    Keeping this aligned with the WebUI route is what unifies the
-    ``<env>`` block, the AGENTS.md / CLAUDE.md / CONTEXT.md custom prompt
-    injection and the sandbox prompt across both entry points.
+    When falling back to step 3 we emit a single WARN-level breadcrumb
+    so operators can spot that channel sessions are silently anchored to
+    the server cwd rather than the WebUI project directory, and configure
+    ``ChannelConfig.workspaceDir`` to fix it.
     """
     if explicit:
         return explicit
@@ -386,7 +388,31 @@ def _resolve_session_directory(explicit: Optional[str]) -> str:
             return instance_dir
     except Exception:
         pass
-    return os.getcwd()
+
+    cwd = os.getcwd()
+    if not _CWD_FALLBACK_WARNED:
+        _mark_cwd_fallback_warned()
+        log.warning("channel.session_directory.cwd_fallback", {
+            "cwd": cwd,
+            "hint": (
+                "ChannelConfig.workspaceDir is unset and no project Instance "
+                "context is available in the channel task; channel-created "
+                "sessions will use the server cwd, which may diverge from "
+                "WebUI sessions. Set channels.<id>.workspaceDir to align."
+            ),
+        })
+    return cwd
+
+
+# Module-level flag so the operator gets the warning exactly once per
+# process — avoids spamming the log on every inbound message while still
+# making the divergence discoverable.
+_CWD_FALLBACK_WARNED: bool = False
+
+
+def _mark_cwd_fallback_warned() -> None:
+    global _CWD_FALLBACK_WARNED
+    _CWD_FALLBACK_WARNED = True
 
 
 def _build_title(msg: InboundMessage) -> str:

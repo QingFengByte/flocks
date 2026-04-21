@@ -401,10 +401,7 @@ class InboundDispatcher:
             # Without this, channel sessions ended up with the hardcoded
             # ``defaults.fallback_*`` values from ``Message.create``, while
             # WebUI sessions got the real resolved model.
-            resolved_model = await _resolve_session_model(
-                binding.session_id,
-                binding.agent_id,
-            )
+            resolved_model = await _resolve_session_model(binding.session_id)
 
             await self._append_user_message(
                 binding.session_id,
@@ -412,6 +409,7 @@ class InboundDispatcher:
                 msg,
                 channel_config,
                 model=resolved_model,
+                agent=binding.agent_id,
             )
 
             # 11. build delivery callbacks
@@ -937,6 +935,7 @@ class InboundDispatcher:
         msg: InboundMessage,
         channel_config: Optional[ChannelConfig] = None,
         model: Optional[dict] = None,
+        agent: Optional[str] = None,
     ) -> None:
         from flocks.session.message import FilePart, Message, MessageRole
 
@@ -954,6 +953,8 @@ class InboundDispatcher:
         )
         if model is not None:
             create_kwargs["model"] = model
+        if agent:
+            create_kwargs["agent"] = agent
 
         message = await Message.create(**create_kwargs)
 
@@ -1017,10 +1018,7 @@ async def _extract_message_text(
         return None
 
 
-async def _resolve_session_model(
-    session_id: str,
-    agent_id: Optional[str],
-) -> Optional[dict]:
+async def _resolve_session_model(session_id: str) -> Optional[dict]:
     """Resolve provider/model for a channel-bound session.
 
     Reuses ``SessionLoop._resolve_model`` so that channel and WebUI follow
@@ -1028,6 +1026,9 @@ async def _resolve_session_model(
     storage → AgentInfo.model → parent → config default → env). Returns
     a ``{"providerID", "modelID"}`` dict on success, ``None`` on failure
     so the caller can fall back to ``Message.create`` defaults.
+
+    The session's own ``agent`` field is what drives agent-scoped lookups
+    inside ``_resolve_model``, so no agent argument is needed here.
     """
     try:
         from flocks.session.session import Session as _Session
@@ -1045,7 +1046,6 @@ async def _resolve_session_model(
     except Exception as exc:
         log.debug("dispatcher.model_resolution_failed", {
             "session": session_id,
-            "agent": agent_id,
             "error": str(exc),
         })
         return None

@@ -423,10 +423,14 @@ class ChannelConfig(BaseModel):
         alias="workspaceDir",
         description=(
             "Working directory used when this channel auto-creates a Flocks session. "
-            "If unset, falls back to the active project Instance directory, then to "
-            "the server process cwd. Aligns channel sessions with WebUI sessions so "
-            "that <env>, AGENTS.md / CLAUDE.md / CONTEXT.md and sandbox prompts are "
-            "the same on both entry points."
+            "Channel inbound runs in a background asyncio task that is NOT wrapped "
+            "by the HTTP Instance middleware, so the project Instance ContextVar is "
+            "typically empty for channel dispatch and the resolver falls back to "
+            "the server process cwd. To make channel-originated sessions inject the "
+            "same <env>, AGENTS.md / CLAUDE.md / CONTEXT.md and sandbox prompts as "
+            "WebUI sessions, set this explicitly to the same directory the WebUI "
+            "server was launched against (the value normally passed via the "
+            "x-flocks-directory request header)."
         ),
     )
 

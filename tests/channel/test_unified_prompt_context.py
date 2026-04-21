@@ -41,6 +41,13 @@ from flocks.channel.inbound.session_binding import (
 from flocks.config.config import ChannelConfig
 
 
+@pytest.fixture(autouse=True)
+def _reset_cwd_warn_flag(monkeypatch):
+    """Reset the once-per-process warn flag so each test gets a clean slate."""
+    monkeypatch.setattr(binding_mod, "_CWD_FALLBACK_WARNED", False)
+    yield
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -88,6 +95,76 @@ class TestResolveSessionDirectory:
             side_effect=RuntimeError("no instance"),
         ):
             assert _resolve_session_directory(None) == os.getcwd()
+
+    def test_cwd_fallback_logs_once_per_process(self):
+        """Operators must see the divergence warning, but not on every msg."""
+        warn_calls = []
+
+        def _spy(message=None, extra=None):
+            warn_calls.append((message, extra))
+
+        with patch(
+            "flocks.project.instance.Instance.get_directory",
+            return_value=None,
+        ), patch.object(binding_mod.log, "warning", side_effect=_spy):
+            _resolve_session_directory(None)
+            _resolve_session_directory(None)
+            _resolve_session_directory(None)
+
+        cwd_warns = [
+            (m, e) for (m, e) in warn_calls
+            if m == "channel.session_directory.cwd_fallback"
+        ]
+        assert len(cwd_warns) == 1, (
+            f"expected exactly one cwd_fallback warning, got {len(cwd_warns)}"
+        )
+        assert cwd_warns[0][1] is not None
+        assert "workspaceDir" in cwd_warns[0][1]["hint"]
+
+    def test_explicit_value_does_not_trigger_warning(self):
+        warn_calls = []
+
+        def _spy(message=None, extra=None):
+            warn_calls.append(message)
+
+        with patch.object(binding_mod.log, "warning", side_effect=_spy):
+            _resolve_session_directory("/explicit/dir")
+
+        assert "channel.session_directory.cwd_fallback" not in warn_calls
+
+    def test_instance_directory_does_not_trigger_warning(self):
+        warn_calls = []
+
+        def _spy(message=None, extra=None):
+            warn_calls.append(message)
+
+        with patch(
+            "flocks.project.instance.Instance.get_directory",
+            return_value="/instance/dir",
+        ), patch.object(binding_mod.log, "warning", side_effect=_spy):
+            _resolve_session_directory(None)
+
+        assert "channel.session_directory.cwd_fallback" not in warn_calls
+
+
+class TestContextVarBoundary:
+    """Document the runtime contract: ``Instance.get_directory()`` is empty
+    inside a bare ``asyncio.create_task`` because the channel gateway
+    spawns its message loops outside the HTTP middleware that populates
+    the ContextVar. This is exactly why ``ChannelConfig.workspaceDir``
+    must be set explicitly to align channel sessions with WebUI sessions.
+    """
+
+    @pytest.mark.asyncio
+    async def test_instance_is_unset_in_detached_task(self):
+        import asyncio
+        from flocks.project.instance import Instance
+
+        async def _from_detached_task():
+            return Instance.get_directory()
+
+        result = await asyncio.create_task(_from_detached_task())
+        assert result is None
 
 
 class TestChannelConfigWorkspaceDir:
@@ -228,7 +305,7 @@ class TestResolveSessionModel:
                  "flocks.session.session_loop.SessionLoop._resolve_model",
                  new=_fake_resolve,
              ):
-            resolved = await _resolve_session_model("ses_x", "rex")
+            resolved = await _resolve_session_model("ses_x")
 
         assert resolved == {
             "providerID": "anthropic",
@@ -241,7 +318,7 @@ class TestResolveSessionModel:
             return None
 
         with patch("flocks.session.session.Session.get_by_id", new=_missing):
-            assert await _resolve_session_model("ghost", "rex") is None
+            assert await _resolve_session_model("ghost") is None
 
     @pytest.mark.asyncio
     async def test_swallows_resolution_errors(self):
@@ -256,7 +333,7 @@ class TestResolveSessionModel:
                  "flocks.session.session_loop.SessionLoop._resolve_model",
                  new=_boom,
              ):
-            assert await _resolve_session_model("ses_y", "rex") is None
+            assert await _resolve_session_model("ses_y") is None
 
 
 class TestAppendUserMessagePersistsModel:
@@ -306,3 +383,46 @@ class TestAppendUserMessagePersistsModel:
             )
 
         assert "model" not in captured
+
+    @pytest.mark.asyncio
+    async def test_agent_is_passed_to_message_create(self):
+        # Without this, last_user.agent silently defaults to "rex" inside
+        # Message.create (line 713), which then propagates as the wrong
+        # parent agent for any subagent task spawned from this turn.
+        captured = {}
+
+        class _StubMessage:
+            id = "msg_3"
+
+        async def _fake_create(**kwargs):
+            captured.update(kwargs)
+            return _StubMessage()
+
+        with patch("flocks.session.message.Message.create", new=_fake_create):
+            await InboundDispatcher._append_user_message(
+                "ses_3", "hi", _msg(), channel_config=None,
+                agent="security_helper",
+            )
+
+        assert captured["agent"] == "security_helper"
+
+    @pytest.mark.asyncio
+    async def test_omits_agent_when_none_or_empty(self):
+        captured = {}
+
+        class _StubMessage:
+            id = "msg_4"
+
+        async def _fake_create(**kwargs):
+            captured.update(kwargs)
+            return _StubMessage()
+
+        with patch("flocks.session.message.Message.create", new=_fake_create):
+            await InboundDispatcher._append_user_message(
+                "ses_4", "hi", _msg(), channel_config=None, agent=None,
+            )
+
+        # When omitted, Message.create's own default ("rex") kicks in —
+        # we don't override it here so the historical behaviour is kept
+        # for sessions whose binding has no agent recorded.
+        assert "agent" not in captured
