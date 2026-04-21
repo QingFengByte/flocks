@@ -106,8 +106,53 @@ async def _get_db() -> aiosqlite.Connection:
         await _db_conn.execute("PRAGMA journal_mode=WAL")
         await _db_conn.execute("PRAGMA busy_timeout=5000")
         await _db_conn.executescript(_DDL)
+        await _migrate_legacy_binding_agent_ids(_db_conn)
         _db_ready = True
         return _db_conn
+
+
+async def _migrate_legacy_binding_agent_ids(db: aiosqlite.Connection) -> None:
+    """One-shot normalisation of pre-unification ``channel_bindings.agent_id``.
+
+    Older builds of the dispatcher used ``channel_config.default_agent or "default"``
+    as the fallback agent name when binding a new conversation, which persisted
+    the literal string ``"default"`` (and occasionally the empty string) into
+    the ``channel_bindings.agent_id`` column. Now that the dispatcher trusts
+    ``binding.agent_id`` for both ``Message.create(agent=...)`` and
+    ``SessionLoop.run(agent_name=...)``, those legacy values would silently
+    propagate a non-existent agent name through the whole loop, where downstream
+    only avoids breakage thanks to the ``Agent.get(name) or Agent.get("rex")``
+    fallback. That fallback hides the divergence rather than fixing it.
+
+    This migration rewrites those legacy rows to ``NULL`` so that the dispatcher
+    falls back to the proper resolution chain (``ChannelConfig.defaultAgent`` →
+    ``Agent.default_agent()`` → ``"rex"``) on the next inbound message. It is
+    safe to run repeatedly: the WHERE clause is empty after the first pass.
+    """
+    try:
+        cursor = await db.execute(
+            "UPDATE channel_bindings "
+            "SET agent_id = NULL "
+            "WHERE agent_id IN ('default', '')",
+        )
+        rewritten = cursor.rowcount or 0
+        await db.commit()
+        if rewritten > 0:
+            log.info("channel.binding.legacy_agent_id_normalised", {
+                "rows": rewritten,
+                "hint": (
+                    "Pre-unification rows had agent_id='default' (or empty); "
+                    "rewriting to NULL so dispatcher resolves the real default "
+                    "agent on the next inbound message."
+                ),
+            })
+    except Exception as exc:
+        # Migration is best-effort. If it fails (e.g. read-only mount) we
+        # log and keep going — the runtime fallback in runner.py still
+        # protects the prompt content even with the legacy values.
+        log.warning("channel.binding.legacy_agent_id_migration_failed", {
+            "error": str(exc),
+        })
 
 
 async def close_binding_db() -> None:

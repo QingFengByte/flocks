@@ -426,3 +426,160 @@ class TestAppendUserMessagePersistsModel:
         # we don't override it here so the historical behaviour is kept
         # for sessions whose binding has no agent recorded.
         assert "agent" not in captured
+
+
+# ---------------------------------------------------------------------------
+# 4. Legacy channel_bindings.agent_id one-shot normalisation
+# ---------------------------------------------------------------------------
+
+class TestLegacyBindingAgentIdMigration:
+    """Older builds wrote the literal ``"default"`` string into
+    ``channel_bindings.agent_id`` whenever ``ChannelConfig.defaultAgent``
+    was unset. Now that the dispatcher trusts ``binding.agent_id`` for
+    both the user-message ``agent`` field and ``SessionLoop.run``'s
+    ``agent_name``, those rows would silently propagate a non-existent
+    agent name through every inbound message until the runner's
+    ``Agent.get(...) or Agent.get("rex")`` fallback masks it. We rewrite
+    them to ``NULL`` once at startup so the dispatcher resolves the
+    proper default chain instead.
+    """
+
+    @pytest.fixture
+    async def db(self, tmp_path):
+        import aiosqlite
+
+        path = tmp_path / "channel_bindings.db"
+        conn = await aiosqlite.connect(str(path))
+        conn.row_factory = aiosqlite.Row
+        await conn.executescript(binding_mod._DDL)
+        try:
+            yield conn
+        finally:
+            await conn.close()
+
+    @staticmethod
+    async def _insert(conn, *, agent_id, chat_id, session_id):
+        import time as _time
+
+        now = _time.time()
+        await conn.execute(
+            "INSERT INTO channel_bindings "
+            "(id, channel_id, account_id, chat_id, chat_type, thread_id, "
+            " session_id, agent_id, created_at, last_message_at) "
+            "VALUES (?, 'wecom', 'default', ?, 'direct', NULL, ?, ?, ?, ?)",
+            (f"chbind_{session_id}", chat_id, session_id, agent_id, now, now),
+        )
+        await conn.commit()
+
+    @pytest.mark.asyncio
+    async def test_rewrites_default_and_empty_to_null(self, db):
+        await self._insert(db, agent_id="default", chat_id="c1", session_id="s1")
+        await self._insert(db, agent_id="", chat_id="c2", session_id="s2")
+        await self._insert(db, agent_id="rex", chat_id="c3", session_id="s3")
+        await self._insert(db, agent_id="security", chat_id="c4", session_id="s4")
+        await self._insert(db, agent_id=None, chat_id="c5", session_id="s5")
+
+        with patch.object(binding_mod.log, "info") as info_log:
+            await binding_mod._migrate_legacy_binding_agent_ids(db)
+
+        # Targeted rows are now NULL.
+        cursor = await db.execute(
+            "SELECT chat_id, agent_id FROM channel_bindings ORDER BY chat_id",
+        )
+        rows = {r["chat_id"]: r["agent_id"] for r in await cursor.fetchall()}
+        assert rows == {
+            "c1": None,
+            "c2": None,
+            "c3": "rex",
+            "c4": "security",
+            "c5": None,
+        }
+
+        # Exactly one INFO log with the rewritten count for the legacy rows.
+        assert info_log.call_count == 1
+        event, payload = info_log.call_args.args
+        assert event == "channel.binding.legacy_agent_id_normalised"
+        assert payload["rows"] == 2
+
+    @pytest.mark.asyncio
+    async def test_is_idempotent_on_second_pass(self, db):
+        await self._insert(db, agent_id="default", chat_id="c1", session_id="s1")
+        await binding_mod._migrate_legacy_binding_agent_ids(db)
+
+        with patch.object(binding_mod.log, "info") as info_log:
+            await binding_mod._migrate_legacy_binding_agent_ids(db)
+
+        # Second pass finds no legacy rows, must not emit a noisy log.
+        assert info_log.call_count == 0
+
+    @pytest.mark.asyncio
+    async def test_is_noop_when_no_legacy_rows(self, db):
+        await self._insert(db, agent_id="rex", chat_id="c1", session_id="s1")
+        await self._insert(db, agent_id=None, chat_id="c2", session_id="s2")
+
+        with patch.object(binding_mod.log, "info") as info_log:
+            await binding_mod._migrate_legacy_binding_agent_ids(db)
+
+        # Nothing rewritten → no INFO log; existing rows untouched.
+        assert info_log.call_count == 0
+        cursor = await db.execute(
+            "SELECT chat_id, agent_id FROM channel_bindings ORDER BY chat_id",
+        )
+        rows = {r["chat_id"]: r["agent_id"] for r in await cursor.fetchall()}
+        assert rows == {"c1": "rex", "c2": None}
+
+    @pytest.mark.asyncio
+    async def test_swallows_db_errors_without_raising(self):
+        # Closed connection → execute raises; the migration must catch it
+        # and only log a warning, never bubble out into _get_db().
+        import aiosqlite
+
+        broken = await aiosqlite.connect(":memory:")
+        await broken.close()
+
+        with patch.object(binding_mod.log, "warning") as warn_log:
+            # Should not raise.
+            await binding_mod._migrate_legacy_binding_agent_ids(broken)
+
+        assert warn_log.call_count == 1
+        event, _payload = warn_log.call_args.args
+        assert event == "channel.binding.legacy_agent_id_migration_failed"
+
+    @pytest.mark.asyncio
+    async def test_get_db_runs_migration_on_init(self, tmp_path, monkeypatch):
+        """End-to-end: ``_get_db()`` must invoke the migration after DDL."""
+        # Reset module-level singleton state so _get_db() really initialises.
+        monkeypatch.setattr(binding_mod, "_db_conn", None)
+        monkeypatch.setattr(binding_mod, "_db_ready", False)
+
+        # Point Storage.get_db_path() at a fresh sqlite file.
+        from flocks.storage.storage import Storage
+
+        db_path = tmp_path / "flocks.db"
+        monkeypatch.setattr(Storage, "get_db_path", staticmethod(lambda: db_path))
+
+        # Pre-create the schema and insert a legacy row, mimicking an upgrade
+        # from an older build that already populated the table.
+        import aiosqlite
+
+        seed = await aiosqlite.connect(str(db_path))
+        await seed.executescript(binding_mod._DDL)
+        await seed.execute(
+            "INSERT INTO channel_bindings "
+            "(id, channel_id, account_id, chat_id, chat_type, thread_id, "
+            " session_id, agent_id, created_at, last_message_at) "
+            "VALUES ('chbind_legacy', 'wecom', 'default', 'c1', 'direct', "
+            "NULL, 's1', 'default', 0, 0)",
+        )
+        await seed.commit()
+        await seed.close()
+
+        try:
+            conn = await binding_mod._get_db()
+            cursor = await conn.execute(
+                "SELECT agent_id FROM channel_bindings WHERE id = 'chbind_legacy'",
+            )
+            row = await cursor.fetchone()
+            assert row["agent_id"] is None
+        finally:
+            await binding_mod.close_binding_db()
