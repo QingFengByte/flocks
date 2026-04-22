@@ -72,17 +72,47 @@ def _aes_cbc_decrypt(cipher_text: str, key: bytes) -> str:
     cipher = Cipher(algorithms.AES(key), modes.CBC(bytearray(16)), backend=backend)
     encryptor = cipher.encryptor()
     ct = encryptor.update(bytes.fromhex(cipher_text)) + encryptor.finalize()
-    return ct.rstrip(b"\x00").decode("utf-8")
+    # Strip both NUL padding and any other trailing non-printable bytes that
+    # the Sangfor SDK historically appends.  ``decode("utf-8")`` would raise
+    # on stray 0x80-0xFF bytes that occasionally leak through after the
+    # ciphertext alignment, so fall back to ``errors="ignore"`` to keep the
+    # AK/SK printable hex characters.
+    plain = ct.rstrip(b"\x00")
+    try:
+        return plain.decode("utf-8")
+    except UnicodeDecodeError:
+        return plain.decode("utf-8", errors="ignore")
 
 
 def _decode_auth_code(auth_code: str) -> tuple[str, str]:
     cached = _AK_SK_CACHE.get(auth_code)
     if cached:
         return cached
-    builder_str = _reverse_hex(auth_code)
-    builders = builder_str.decode("utf-8").split("|")
+    if not auth_code:
+        raise ValueError("auth_code is empty")
+    cleaned = auth_code.strip()
+    # Reject obviously non-hex inputs early with a clear message instead of
+    # the cryptic ``binascii.Error: Non-hexadecimal digit found``.
+    try:
+        builder_bytes = _reverse_hex(cleaned)
+    except (binascii.Error, ValueError) as exc:
+        raise ValueError(
+            "auth_code is not a valid hex string. Please copy the 联动码 "
+            "from XDR (配置管理 → 系统设置 → 开放性 → 联动码管理)."
+        ) from exc
+    try:
+        builder_str = builder_bytes.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError(
+            "auth_code decoded bytes are not valid UTF-8 — likely a wrong or "
+            "truncated 联动码."
+        ) from exc
+    builders = builder_str.split("|")
     if len(builders) != AUTH_CODE_PARAMS_NUM:
-        raise ValueError(f"auth_code decode error: expected {AUTH_CODE_PARAMS_NUM} parts, got {len(builders)}")
+        raise ValueError(
+            f"auth_code decode error: expected {AUTH_CODE_PARAMS_NUM} parts, "
+            f"got {len(builders)}"
+        )
     aes_secret = _calculate_aes_secret(builders)
     ak = _aes_cbc_decrypt(builders[9], aes_secret)
     sk = _aes_cbc_decrypt(builders[10], aes_secret)
@@ -205,7 +235,21 @@ def _resolve_runtime_config() -> RuntimeConfig:
     raw = raw if isinstance(raw, dict) else {}
 
     host = (_resolve_ref(raw.get("host")) or os.getenv("SANGFOR_XDR_HOST") or "").strip()
-    port_raw = raw.get("port") or DEFAULT_PORT
+    # Tolerate users pasting the full URL (with scheme and/or trailing slash)
+    # in the WebUI ``host`` field — without this normalisation we would build
+    # ``https://https://10.0.0.1`` which silently routes to nowhere.
+    if "://" in host:
+        host = host.split("://", 1)[1]
+    host = host.strip("/").strip()
+    # The host field may also contain an inline port (``10.0.0.1:8443``).
+    inline_port: Optional[int] = None
+    if ":" in host and not host.startswith("["):
+        host_part, _, port_part = host.partition(":")
+        if port_part.isdigit():
+            host = host_part
+            inline_port = int(port_part)
+
+    port_raw = raw.get("port") or inline_port or DEFAULT_PORT
     try:
         port = int(str(port_raw).strip())
     except (TypeError, ValueError):
@@ -259,6 +303,11 @@ async def _request(
     payload = json.dumps(data) if data else ""
     headers = {CONTENT_TYPE_KEY: DEFAULT_CONTENT_TYPE}
     headers = _sign_request(ak, sk, method, url, headers, params=params, payload=payload)
+    # Ask the server not to compress the response — some XDR appliances ignore
+    # ``Accept-Encoding`` negotiation and ship gzip bytes that aiohttp cannot
+    # transparently decode on every code path, surfacing as
+    # ``'utf-8' codec can't decode byte 0x8d in position 0``.
+    headers.setdefault("Accept-Encoding", "identity")
 
     kwargs: dict[str, Any] = {"headers": headers}
     if method.upper() in ("POST", "PUT", "PATCH", "DELETE"):
@@ -267,16 +316,46 @@ async def _request(
         kwargs["params"] = params
 
     async with session.request(method, url, **kwargs) as resp:
-        try:
-            result = await resp.json(content_type=None)
-        except Exception:
-            text = await resp.text()
-            raise RuntimeError(f"XDR response parse error (HTTP {resp.status}): {text[:500]}")
+        raw_bytes = await resp.read()
+        result = _parse_response_body(raw_bytes, resp.status)
 
     code = result.get("code")
     if code == "Success" or code == 0:
         return result
     raise RuntimeError(f"XDR API error: code={code}, message={result.get('message', '')}")
+
+
+def _parse_response_body(raw: bytes, status: int) -> dict[str, Any]:
+    """Decode an XDR response body with broad encoding tolerance.
+
+    The Sangfor XDR appliance has been observed returning JSON encoded as
+    UTF-8, GBK or even raw bytes that fail strict UTF-8 validation
+    (``0x8d`` in position 0).  ``aiohttp`` defaults to UTF-8, which made
+    every connectivity probe surface a misleading
+    ``'utf-8' codec can't decode byte 0x8d`` error.
+    """
+    if not raw:
+        raise RuntimeError(f"XDR returned empty body (HTTP {status})")
+    last_error: Optional[Exception] = None
+    for encoding in ("utf-8", "utf-8-sig", "gbk", "gb18030", "latin-1"):
+        try:
+            text = raw.decode(encoding)
+        except UnicodeDecodeError as exc:
+            last_error = exc
+            continue
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError as exc:
+            last_error = exc
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+        return {"code": "Success", "data": parsed}
+    snippet = raw[:120].hex()
+    raise RuntimeError(
+        f"XDR response parse error (HTTP {status}): could not decode body "
+        f"(first bytes hex={snippet}, last={last_error})"
+    )
 
 
 async def _run_request(

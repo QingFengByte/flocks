@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import ast
 import importlib.util
+import inspect
 import re
 import urllib.parse
 from pathlib import Path
@@ -395,8 +396,45 @@ def _build_script_handler(cfg: dict, yaml_path: Path) -> ToolHandler:
     if not callable(fn):
         raise TypeError(f"'{function_name}' in {script_path} is not callable")
 
+    # Inspect the target function signature once so the wrapper can adapt the
+    # invocation to legacy handlers that either:
+    #   * read parameters from ``ctx.params`` (signature: ``(ctx) -> ...``); or
+    #   * take parameters as explicit keyword arguments / ``**kwargs``.
+    #
+    # Without this adaptation, callers like the test-credentials flow that
+    # invoke ``ToolRegistry.execute(tool_name, **params)`` would either raise
+    # ``TypeError: got an unexpected keyword argument`` or
+    # ``AttributeError: 'ToolContext' object has no attribute 'params'``.
+    fn_sig = inspect.signature(fn)
+    fn_params = fn_sig.parameters
+    fn_has_var_kw = any(
+        p.kind == inspect.Parameter.VAR_KEYWORD for p in fn_params.values()
+    )
+    fn_param_names = {
+        name
+        for name, p in fn_params.items()
+        if p.kind
+        in (
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            inspect.Parameter.KEYWORD_ONLY,
+        )
+    }
+
     async def handler(ctx: ToolContext, **kwargs: Any) -> ToolResult:
-        result = await fn(ctx, **kwargs)
+        # Always expose the raw kwargs on the context so handlers that read
+        # from ``ctx.params`` (e.g. ``params = dict(ctx.params)``) keep working
+        # regardless of whether the caller created a fresh ``ToolContext``.
+        try:
+            ctx.params = kwargs  # type: ignore[attr-defined]
+        except AttributeError:
+            pass
+
+        if fn_has_var_kw:
+            call_kwargs = kwargs
+        else:
+            call_kwargs = {k: v for k, v in kwargs.items() if k in fn_param_names}
+
+        result = await fn(ctx, **call_kwargs)
         if isinstance(result, ToolResult):
             return result
         return ToolResult(success=True, output=result)
