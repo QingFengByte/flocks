@@ -591,11 +591,17 @@ async def run_whitelists(ctx: ToolContext) -> ToolResult:
     action = params.pop("action", "list")
 
     if action == "list":
-        body: dict[str, Any] = {}
-        if params.get("page_size"):
-            body["pageSize"] = int(params["page_size"])
-        if params.get("page_num"):
-            body["pageNum"] = int(params["page_num"])
+        # Spec (开放接口列表 → POST /api/xdr/v1/whitelists/list) defines the
+        # paging keys as ``page`` and ``pageSize`` (NOT ``pageNum``).  This
+        # XDR build hard-rejects ``pageNum`` with
+        # ``param page cannot be null`` because it never finds the expected
+        # key.  Always default page=1 / pageSize=20 so the WebUI
+        # connectivity probe (which sends no params) still satisfies the
+        # appliance's strict validator.
+        body: dict[str, Any] = {
+            "page": int(params.get("page_num") or params.get("page") or 1),
+            "pageSize": int(params.get("page_size") or 20),
+        }
         return await _run_request("POST", "/api/xdr/v1/whitelists/list", data=body)
 
     elif action == "create":
@@ -688,11 +694,12 @@ async def run_vulns(ctx: ToolContext) -> ToolResult:
     action = params.pop("action", "baseline")
 
     if action == "baseline":
-        body: dict[str, Any] = {}
-        if params.get("page_size"):
-            body["pageSize"] = int(params["page_size"])
-        if params.get("page_num"):
-            body["pageNum"] = int(params["page_num"])
+        # Spec uses ``page`` / ``pageSize``; we tolerate the legacy
+        # ``page_num`` alias for backwards compatibility.
+        body: dict[str, Any] = {
+            "page": int(params.get("page_num") or params.get("page") or 1),
+            "pageSize": int(params.get("page_size") or 20),
+        }
         return await _run_request("POST", "/api/xdr/v1/vuls/baseline/list", data=body)
 
     elif action == "update_status":
@@ -706,14 +713,18 @@ async def run_vulns(ctx: ToolContext) -> ToolResult:
         return await _run_request("GET", "/api/xdr/v1/vuls/sourcedevice")
 
     elif action == "vuln_list":
-        body = {}
-        if params.get("page_size"):
-            body["pageSize"] = int(params["page_size"])
-        if params.get("page_num"):
-            body["pageNum"] = int(params["page_num"])
         # Spec: POST /api/xdr/v1/vuls/risk/list (获取漏洞、弱密码数据).
-        # The legacy ``/api/xdr/v1/vuls/list`` path does not exist in the
-        # 开放接口列表 and was returning 404 / signature failures.
+        # The 开放接口列表 marks ``dataType`` as the *only* paramNotNull=0
+        # (i.e. required) request field; the appliance returns
+        # "请求参数校验失败" if it is missing.  Default to ``loophole``
+        # (vulnerabilities) and let callers override with ``weakpwd`` when
+        # they want weak-password records instead.
+        data_type = params.get("data_type") or "loophole"
+        body: dict[str, Any] = {
+            "dataType": data_type,
+            "page": int(params.get("page_num") or params.get("page") or 1),
+            "pageSize": int(params.get("page_size") or 20),
+        }
         return await _run_request("POST", "/api/xdr/v1/vuls/risk/list", data=body)
 
     else:

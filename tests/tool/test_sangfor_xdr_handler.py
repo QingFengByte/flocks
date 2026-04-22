@@ -343,6 +343,86 @@ def test_request_serialises_body_for_empty_containers(handler, data, expected_bo
     )
 
 
+# ---------------------------------------------------------------------------
+# Action-specific body shape (regression for "param page cannot be null"
+# and "请求参数校验失败" surfaced by the second WebUI test report)
+# ---------------------------------------------------------------------------
+
+def _run_action(handler, run_fn, params: dict[str, Any]) -> dict[str, Any]:
+    """Invoke a tool handler with patched IO and return the body that
+    ``_run_request`` would have transmitted, plus the method/path."""
+    import asyncio
+
+    captured: dict[str, Any] = {}
+
+    async def _fake_run_request(method, path, data=None, params=None):
+        captured["method"] = method
+        captured["path"] = path
+        captured["data"] = data
+        captured["params"] = params
+
+        class _R:
+            success = True
+            error = None
+            data = {"code": "Success"}
+
+        return _R()
+
+    ctx = type("_Ctx", (), {"params": params})()
+
+    with patch.object(handler, "_run_request", side_effect=_fake_run_request):
+        asyncio.run(run_fn(ctx))
+
+    return captured
+
+
+def test_whitelists_list_uses_page_not_pageNum(handler):
+    """Spec defines the paging key as ``page``; the appliance rejects
+    ``pageNum`` with ``param page cannot be null``."""
+    captured = _run_action(handler, handler.run_whitelists, {"action": "list"})
+    assert captured["path"] == "/api/xdr/v1/whitelists/list"
+    body = captured["data"]
+    assert "page" in body, f"expected 'page' key, got {body!r}"
+    assert "pageNum" not in body, f"'pageNum' must not appear, got {body!r}"
+    assert body["page"] == 1
+    assert body["pageSize"] == 20
+
+
+def test_whitelists_list_honours_explicit_paging(handler):
+    captured = _run_action(
+        handler,
+        handler.run_whitelists,
+        {"action": "list", "page_num": 3, "page_size": 50},
+    )
+    assert captured["data"] == {"page": 3, "pageSize": 50}
+
+
+def test_vuln_list_includes_required_dataType(handler):
+    """Spec marks ``dataType`` as the only paramNotNull=0 field on
+    /vuls/risk/list; missing it produces ``请求参数校验失败``."""
+    captured = _run_action(handler, handler.run_vulns, {"action": "vuln_list"})
+    assert captured["path"] == "/api/xdr/v1/vuls/risk/list"
+    body = captured["data"]
+    assert body["dataType"] == "loophole"
+    assert body["page"] == 1
+    assert body["pageSize"] == 20
+
+
+def test_vuln_list_allows_weakpwd_dataType(handler):
+    captured = _run_action(
+        handler,
+        handler.run_vulns,
+        {"action": "vuln_list", "data_type": "weakpwd"},
+    )
+    assert captured["data"]["dataType"] == "weakpwd"
+
+
+def test_baseline_list_uses_page_not_pageNum(handler):
+    captured = _run_action(handler, handler.run_vulns, {"action": "baseline"})
+    body = captured["data"]
+    assert "page" in body and "pageNum" not in body, body
+
+
 def test_request_get_does_not_transmit_body_but_signs_canonical_payload(handler):
     """GET requests must not put a body on the wire, but the signed payload
     hash should still reflect ``""`` (not ``{}``) for null ``data``."""

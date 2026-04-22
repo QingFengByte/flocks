@@ -32,6 +32,15 @@ inputSchema:
       type: integer
       description: 页码，从 1 开始。
       default: 1
+    data_type:
+      type: string
+      description: >
+        脆弱性类型（vuln_list 时使用，spec 中此字段为唯一必填项；
+        缺失会触发"请求参数校验失败"）：
+        - `loophole` ：漏洞数据（默认）
+        - `weakpwd`  ：弱密码数据
+      enum: [loophole, weakpwd]
+      default: loophole
     ids:
       type: array
       description: 漏洞 ID 列表（update_status 时使用）。
