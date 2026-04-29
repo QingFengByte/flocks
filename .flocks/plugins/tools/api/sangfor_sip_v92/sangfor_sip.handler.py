@@ -88,6 +88,29 @@ def _service_config() -> dict[str, Any]:
     return raw if isinstance(raw, dict) else {}
 
 
+def _resolve_verify_ssl(raw: dict[str, Any]) -> bool:
+    """Resolve the SSL-verify toggle from the API service config.
+
+    Resolution order (matches PR #193 onesec/qingteng/ngtip pattern):
+      1. ``verify_ssl``                  – canonical key
+      2. ``ssl_verify``                  – backward-compatible alias
+      3. ``custom_settings.verify_ssl``  – where the WebUI bottom toggle writes
+      4. fallback ``False``              – default OFF (private/self-signed deployments)
+    """
+    value = raw.get("verify_ssl")
+    if value is None:
+        value = raw.get("ssl_verify")
+    if value is None:
+        custom_settings = raw.get("custom_settings", {})
+        if isinstance(custom_settings, dict):
+            value = custom_settings.get("verify_ssl", False)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
 def _resolve_runtime_config() -> RuntimeConfig:
     raw = _service_config()
 
@@ -132,11 +155,7 @@ def _resolve_runtime_config() -> RuntimeConfig:
         or ""
     ).strip()
 
-    verify_ssl_raw = raw.get("verify_ssl", "false")
-    if isinstance(verify_ssl_raw, bool):
-        verify_ssl = verify_ssl_raw
-    else:
-        verify_ssl = str(verify_ssl_raw).strip().lower() in {"1", "true", "yes", "on"}
+    verify_ssl = _resolve_verify_ssl(raw)
 
     if not host:
         raise ValueError(
