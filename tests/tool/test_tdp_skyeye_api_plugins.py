@@ -742,7 +742,7 @@ def test_tdp_incident_yaml_loads_with_provider():
     tool = yaml_to_tool(raw, yaml_path)
 
     assert tool.info.name == "tdp_incident_list"
-    assert tool.info.provider == "tdp_api"
+    assert tool.info.provider == "tdp_api_v3_3_10"
     assert "body" not in raw["inputSchema"]["properties"]
     assert "condition" in raw["inputSchema"]["properties"]
     assert "severity" in raw["inputSchema"]["properties"]
@@ -782,7 +782,7 @@ def test_tdp_platform_yaml_uses_keyword_and_requires_confirmation():
     tool = yaml_to_tool(raw, yaml_path)
 
     assert tool.info.name == "tdp_platform_config"
-    assert tool.info.provider == "tdp_api"
+    assert tool.info.provider == "tdp_api_v3_3_10"
     assert raw["requires_confirmation"] is True
     assert "keyword" in raw["inputSchema"]["properties"]
     assert "device_id" not in raw["inputSchema"]["properties"]
@@ -795,7 +795,7 @@ def test_tdp_policy_yaml_requires_confirmation_and_uses_object_ioc_list():
     tool = yaml_to_tool(raw, yaml_path)
 
     assert tool.info.name == "tdp_policy_settings"
-    assert tool.info.provider == "tdp_api"
+    assert tool.info.provider == "tdp_api_v3_3_10"
     assert raw["requires_confirmation"] is True
     assert raw["inputSchema"]["properties"]["ioc_list"]["items"]["type"] == "object"
     assert raw["inputSchema"]["properties"]["severity"]["type"] == "integer"
@@ -807,7 +807,7 @@ def test_tdp_log_yaml_uses_object_columns_and_supports_cascade_asset_group():
     tool = yaml_to_tool(raw, yaml_path)
 
     assert tool.info.name == "tdp_log_search"
-    assert tool.info.provider == "tdp_api"
+    assert tool.info.provider == "tdp_api_v3_3_10"
     assert raw["inputSchema"].get("required") == []
     assert raw["inputSchema"]["properties"]["columns"]["items"]["type"] == "object"
     assert "cascade_asset_group" in raw["inputSchema"]["properties"]
@@ -819,7 +819,7 @@ def test_skyeye_alarm_list_yaml_loads_with_provider():
     tool = yaml_to_tool(raw, yaml_path)
 
     assert tool.info.name == "skyeye_alarm_list"
-    assert tool.info.provider == "skyeye_api"
+    assert tool.info.provider == "skyeye_api_v4_0_14_0_SP2"
 
 
 def test_skyeye_verify_ssl_defaults_false_when_unset():

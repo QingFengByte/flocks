@@ -1297,6 +1297,7 @@ def _build_api_service_summary(
 async def list_api_services() -> List[APIServiceSummary]:
     try:
         from flocks.tool.registry import ToolRegistry
+        from flocks.config.api_service_versioning import shadowed_legacy_ids
 
         ToolRegistry.init()
 
@@ -1305,6 +1306,10 @@ async def list_api_services() -> List[APIServiceSummary]:
         raw_statuses = await _read_api_service_status_cache()
 
         service_ids = configured_services | discovered_services
+        # Hide each legacy ``api_services[<service_id>]`` block once its
+        # versioned ``<service_id>_v<version>`` counterpart exists, so
+        # the user does not see duplicate entries after migration.
+        service_ids -= shadowed_legacy_ids(service_ids)
         summaries = [
             _build_api_service_summary(provider_id, raw_statuses)
             for provider_id in service_ids
@@ -1476,9 +1481,21 @@ async def get_api_service_metadata(provider_id: str):
 
 
 def _load_provider_yaml_metadata(provider_id: str) -> Optional[Dict[str, Any]]:
-    """Load metadata from a _provider.yaml file for YAML-based API tools."""
+    """Load metadata from a ``_provider.yaml`` file for YAML-based API tools.
+
+    Resolves ``provider_id`` against (in priority order):
+
+    1. A directory named exactly ``provider_id`` (the conventional layout).
+    2. A ``_provider.yaml`` whose derived ``storage_key`` matches — handles
+       the post-versioning case where ``provider_id`` is e.g.
+       ``tdp_api_v3_3_10`` but the on-disk dir is ``tdp_v3_3_10``.
+    3. A ``_provider.yaml`` whose unversioned ``service_id`` matches —
+       legacy callers that still use bare ``service_id``.
+    """
     try:
         from flocks.plugin.loader import DEFAULT_PLUGIN_ROOT
+        from flocks.config.api_service_versioning import derive_storage_key
+        from flocks.tool.tool_loader import extract_provider_version
         import yaml
 
         api_roots = [
@@ -1509,10 +1526,17 @@ def _load_provider_yaml_metadata(provider_id: str) -> Optional[Dict[str, Any]]:
                     })
                     continue
 
-                if (
-                    isinstance(candidate_provider, dict)
-                    and candidate_provider.get("service_id") == provider_id
-                ):
+                if not isinstance(candidate_provider, dict):
+                    continue
+
+                cand_service_id = candidate_provider.get("service_id")
+                cand_version = extract_provider_version(candidate_provider)
+                cand_storage_key = (
+                    derive_storage_key(cand_service_id, cand_version)
+                    if cand_service_id else None
+                )
+
+                if cand_storage_key == provider_id or cand_service_id == provider_id:
                     api_dir = candidate
                     break
 

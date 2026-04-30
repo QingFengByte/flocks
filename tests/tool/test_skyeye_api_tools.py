@@ -91,7 +91,7 @@ async def test_skyeye_dashboard_view_tool_uses_custom_login_flow():
         result = await tool.handler(ToolContext(session_id="test", message_id="test"))
 
     assert tool.info.source == "api"
-    assert tool.info.provider == "skyeye_api"
+    assert tool.info.provider == "skyeye_api_v4_0_14_0_SP2"
     assert result.success is True
     assert result.output["data"]["items"] == {"value": 42}
     assert result.metadata["api"] == "monitor_center_dashboard_view"
